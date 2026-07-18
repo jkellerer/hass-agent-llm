@@ -581,7 +581,16 @@ class ServiceCustomTool(BaseTool):
             # Render data templates if present
             service_data = {}
             if "data" in self._handler_config:
-                for key, value in self._handler_config["data"].items():
+                data = self._handler_config["data"]
+                if isinstance(data, str):
+                    data = await self._render_template(data, kwargs)
+                if not isinstance(data, dict):
+                    raise ValidationError(
+                        f"Invalid service data format '{data}'. "
+                        'Expected format: {"data": {"param_name": "param_value"} }'
+                    )
+
+                for key, value in data.items():
                     if isinstance(value, str):
                         # Render template for string values, treat None as unset
                         value = await self._render_template(value, kwargs)
