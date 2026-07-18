@@ -583,8 +583,12 @@ class ServiceCustomTool(BaseTool):
             if "data" in self._handler_config:
                 for key, value in self._handler_config["data"].items():
                     if isinstance(value, str):
-                        # Render template for string values
-                        service_data[key] = await self._render_template(value, kwargs)
+                        # Render template for string values, treat None as unset
+                        value = await self._render_template(value, kwargs)
+                        if value is None:
+                            del service_data[key]
+                        else:
+                            service_data[key] = value
                     else:
                         # Use non-string values as-is
                         service_data[key] = value
