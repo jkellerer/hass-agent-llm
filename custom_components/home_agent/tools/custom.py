@@ -524,27 +524,26 @@ class ServiceCustomTool(BaseTool):
 
         # Validate service format (should be domain.service_name)
         service = self._handler_config["service"]
-        if "." not in service:
-            raise ValidationError(
-                f"Invalid service format '{service}'. "
-                "Expected format: domain.service_name (e.g., 'automation.trigger')"
-            )
-
         parts = service.split(".", 1)
         if len(parts) != 2 or not parts[0] or not parts[1]:
-            raise ValidationError(
+            err = ValidationError(
                 f"Invalid service format '{service}'. "
                 "Expected format: domain.service_name (e.g., 'automation.trigger')"
             )
+            if "{{" in service:
+                _LOGGER.warning(f"Service template may cause: {' '.join(err.args)}")
+            else:
+                raise err
 
         # Warn if service doesn't exist (but don't fail setup)
-        domain, service_name = parts
-        if not self.hass.services.has_service(domain, service_name):
-            _LOGGER.warning(
-                "Service '%s' not found in Home Assistant. "
-                "The tool will still be registered but may fail when executed.",
-                service,
-            )
+        if len(parts) == 2:
+            domain, service_name = parts
+            if not self.hass.services.has_service(domain, service_name):
+                _LOGGER.warning(
+                    "Service '%s' not found in Home Assistant. "
+                    "The tool will still be registered but may fail when executed.",
+                    service,
+                )
 
     @property
     def name(self) -> str:
@@ -575,7 +574,7 @@ class ServiceCustomTool(BaseTool):
         """
         try:
             # Parse service domain and name
-            service = self._handler_config["service"]
+            service = str(await self._render_template(self._handler_config["service"], kwargs))
             domain, service_name = service.split(".", 1)
 
             # Render data templates if present
