@@ -59,6 +59,7 @@ CONF_HISTORY_ENABLED: Final = "history_enabled"
 CONF_HISTORY_MAX_MESSAGES: Final = "history_max_messages"
 CONF_HISTORY_MAX_TOKENS: Final = "history_max_tokens"
 CONF_HISTORY_PERSIST: Final = "history_persist"
+CONF_HISTORY_RECORD_TOOL_CALLS: Final = "history_record_tool_calls"
 CONF_MAX_CONTEXT_TOKENS: Final = "max_context_tokens"
 
 # Configuration keys - Context Optimization
@@ -191,6 +192,7 @@ DEFAULT_HISTORY_ENABLED: Final = True
 DEFAULT_HISTORY_MAX_MESSAGES: Final = 10
 DEFAULT_HISTORY_MAX_TOKENS: Final = 4000
 DEFAULT_HISTORY_PERSIST: Final = True
+DEFAULT_HISTORY_RECORD_TOOL_CALLS: Final = True
 
 # Default values - Context Optimization
 DEFAULT_COMPRESSION_LEVEL: Final = "medium"

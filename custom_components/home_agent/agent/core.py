@@ -119,6 +119,7 @@ from ..const import (
     CONF_HISTORY_MAX_MESSAGES,
     CONF_HISTORY_MAX_TOKENS,
     CONF_HISTORY_PERSIST,
+    CONF_HISTORY_RECORD_TOOL_CALLS,
     CONF_LLM_MODEL,
     CONF_MEMORY_EXTRACTION_ENABLED,
     CONF_PROMPT_CUSTOM_ADDITIONS,
@@ -268,6 +269,29 @@ class HomeAgent(
         if self.memory_manager is not None:
             self.context_manager.set_memory_provider(self.memory_manager)
             _LOGGER.debug("Memory context provider enabled")
+
+    @staticmethod
+    def _filter_tool_messages(messages):
+        """Filter out tool-related messages from a message list.
+
+        When CONF_HISTORY_RECORD_TOOL_CALLS is False, this method removes:
+        - Messages with role='tool' (tool results)
+        - Assistant messages that contain tool_calls (tool invocation requests)
+
+        This preserves the conversation flow (user → assistant text responses)
+        without the intermediate tool call details, saving tokens in history.
+
+        Args:
+            messages: List of message dicts from conversation history
+
+        Returns:
+            Filtered list of messages with tool messages removed
+        """
+        return [
+            msg for msg in messages
+            if msg.get("role") != "tool"
+            and "tool_calls" not in msg
+        ]
 
     async def async_process(
         self, user_input: ha_conversation.ConversationInput
@@ -1256,17 +1280,26 @@ class HomeAgent(
                 )
 
         # Save to conversation history if enabled
+        # Save the full turn including tool calls and results in order
         if self.config.get(CONF_HISTORY_ENABLED, True):
-            # Extract final response from chat log
+            # messages = [system] + old_history + current_turn
+            # Extract the current turn messages
+            old_history = self.conversation_manager.get_history(conversation_id)
+            turn_start = 1 + len(old_history)  # 1 for system prompt
+            turn_messages = messages[turn_start:]
+
+            # Filter out tool messages if recording is disabled
+            if not self.config.get(CONF_HISTORY_RECORD_TOOL_CALLS, True):
+                turn_messages = self._filter_tool_messages(turn_messages)
+
+            self.conversation_manager.add_messages(conversation_id, turn_messages)
+
+            # Extract final response for memory extraction (used below)
             final_response = ""
             for content_item in new_content:
                 if isinstance(content_item, conversation.AssistantContent) and content_item.content:
                     final_response = content_item.content
                     break
-
-            self.conversation_manager.add_message(conversation_id, "user", user_message)
-            if final_response:
-                self.conversation_manager.add_message(conversation_id, "assistant", final_response)
 
         # Extract and store memories if enabled (fire and forget)
         if self.config.get(CONF_MEMORY_EXTRACTION_ENABLED, DEFAULT_MEMORY_EXTRACTION_ENABLED):
@@ -1537,11 +1570,38 @@ class HomeAgent(
                     metrics["performance"]["tool_latency_ms"] = total_tool_latency_ms
 
                 # Save to conversation history
+                # Save the full turn including tool calls and results in order
                 if self.config.get(CONF_HISTORY_ENABLED, True):
-                    self.conversation_manager.add_message(conversation_id, "user", user_message)
-                    self.conversation_manager.add_message(
-                        conversation_id, "assistant", final_content
-                    )
+                    # messages[0] = system prompt, messages[1:history_len] = old history
+                    # messages[history_len:] = current turn (user + assistant/tool messages)
+                    # Extract the current turn messages from the full messages list
+                    history_len = len(messages) - 1  # Subtract system prompt
+                    # The history portion was added via messages.extend(history)
+                    # We need to find where the current turn starts.
+                    # messages = [system] + history + current_turn
+                    # current turn starts after system + history
+                    if self.config.get(CONF_HISTORY_ENABLED, True) and len(messages) > 1:
+                        # history was retrieved before the tool loop;
+                        # the current turn is everything after system + old history
+                        old_history = self.conversation_manager.get_history(conversation_id)
+                        turn_start = 1 + len(old_history)  # 1 for system prompt
+                    else:
+                        turn_start = 1  # Just system prompt, no history
+                    turn_messages = messages[turn_start:]
+
+                    # Add the final assistant response to turn_messages
+                    # (when there are no tool calls, the assistant message is not
+                    # appended to messages in the loop, so we add it here for history)
+                    turn_messages.append({
+                        "role": "assistant",
+                        "content": final_content,
+                    })
+
+                    # Filter out tool messages if recording is disabled
+                    if not self.config.get(CONF_HISTORY_RECORD_TOOL_CALLS, True):
+                        turn_messages = self._filter_tool_messages(turn_messages)
+
+                    self.conversation_manager.add_messages(conversation_id, turn_messages)
 
                 # Extract and store memories if enabled (fire and forget)
                 if self.config.get(

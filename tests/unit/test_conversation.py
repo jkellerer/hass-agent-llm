@@ -606,7 +606,7 @@ class TestConversationPersistence:
 
         # Verify the data structure passed to async_save
         call_args = manager._store.async_save.call_args[0][0]
-        assert call_args["version"] == 1
+        assert call_args["version"] == 2
         assert "conversations" in call_args
         assert "conv_123" in call_args["conversations"]
         assert len(call_args["conversations"]["conv_123"]) == 2
@@ -1048,3 +1048,346 @@ class TestConversationPersistence:
         assert len(history) == 2
         assert history[0]["content"] == "Hello"
         assert history[1]["content"] == "Hi there!"
+
+
+class TestToolCallMessages:
+    """Test tool call message support in ConversationHistoryManager."""
+
+    def test_add_assistant_message_with_tool_calls_dict_format(self):
+        """Test adding assistant message with tool_calls using dict format."""
+        manager = ConversationHistoryManager()
+        tool_calls_msg = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_xxx",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": '{"location": "NYC"}'},
+                }
+            ],
+        }
+        manager.add_message("conv_123", tool_calls_msg)
+
+        assert len(manager._histories["conv_123"]) == 1
+        msg = manager._histories["conv_123"][0]
+        assert msg["role"] == "assistant"
+        assert msg["tool_calls"] == tool_calls_msg["tool_calls"]
+        assert "timestamp" in msg
+
+    def test_add_tool_result_message(self):
+        """Test adding tool result message with tool_call_id."""
+        manager = ConversationHistoryManager()
+        tool_result_msg = {
+            "role": "tool",
+            "tool_call_id": "call_xxx",
+            "content": '{"temperature": 25, "condition": "sunny"}',
+        }
+        manager.add_message("conv_123", tool_result_msg)
+
+        assert len(manager._histories["conv_123"]) == 1
+        msg = manager._histories["conv_123"][0]
+        assert msg["role"] == "tool"
+        assert msg["tool_call_id"] == "call_xxx"
+        assert msg["content"] == '{"temperature": 25, "condition": "sunny"}'
+
+    def test_tool_message_with_empty_content_allowed(self):
+        """Test that tool messages with empty content are accepted."""
+        manager = ConversationHistoryManager()
+        tool_result_msg = {
+            "role": "tool",
+            "tool_call_id": "call_xxx",
+            "content": "",
+        }
+        manager.add_message("conv_123", tool_result_msg)
+
+        # Tool messages with empty content should be accepted
+        assert len(manager._histories["conv_123"]) == 1
+
+    def test_is_tool_message_detects_tool_role(self):
+        """Test _is_tool_message returns True for role=tool."""
+        manager = ConversationHistoryManager()
+        msg = {"role": "tool", "tool_call_id": "call_x", "content": "result"}
+        assert manager._is_tool_message(msg) is True
+
+    def test_is_tool_message_detects_assistant_with_tool_calls(self):
+        """Test _is_tool_message returns True for assistant with tool_calls."""
+        manager = ConversationHistoryManager()
+        msg = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_x", "type": "function", "function": {}}],
+        }
+        assert manager._is_tool_message(msg) is True
+
+    def test_is_tool_message_false_for_normal_messages(self):
+        """Test _is_tool_message returns False for normal messages."""
+        manager = ConversationHistoryManager()
+        assert manager._is_tool_message({"role": "user", "content": "Hello"}) is False
+        assert manager._is_tool_message({"role": "assistant", "content": "Hi"}) is False
+
+    def test_is_tool_message_false_for_assistant_without_tool_calls(self):
+        """Test _is_tool_message returns False for assistant without tool_calls."""
+        manager = ConversationHistoryManager()
+        msg = {"role": "assistant", "content": "Hello there!"}
+        assert manager._is_tool_message(msg) is False
+
+    def test_count_conversation_turns_excludes_tool_messages(self):
+        """Test _count_conversation_turns excludes tool messages from count."""
+        manager = ConversationHistoryManager()
+        messages = [
+            {"role": "user", "content": "What's the weather?"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"},
+            {"role": "assistant", "content": "It's sunny."},
+        ]
+        # 2 real turns: user question + assistant text response
+        # Tool messages (assistant with tool_calls + tool result) are excluded
+        turns = manager._count_conversation_turns(messages)
+        assert turns == 2
+
+    def test_count_conversation_turns_all_text(self):
+        """Test _count_conversation_turns with only text messages."""
+        manager = ConversationHistoryManager()
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+            {"role": "user", "content": "How are you?"},
+        ]
+        turns = manager._count_conversation_turns(messages)
+        assert turns == 3
+
+    def test_count_conversation_turns_empty(self):
+        """Test _count_conversation_turns with empty list."""
+        manager = ConversationHistoryManager()
+        turns = manager._count_conversation_turns([])
+        assert turns == 0
+
+    def test_trim_history_preserves_tool_chains(self):
+        """Test that trimming preserves tool message chains and only removes complete turns."""
+        manager = ConversationHistoryManager(max_messages=2)
+        # Add 3 user turns with tool calls in the middle
+        manager.add_message("conv_123", {"role": "user", "content": "First question"})
+        manager.add_message("conv_123", {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {}}]})
+        manager.add_message("conv_123", {"role": "tool", "tool_call_id": "call_1", "content": "result1"})
+        manager.add_message("conv_123", {"role": "assistant", "content": "First answer"})
+
+        manager.add_message("conv_123", {"role": "user", "content": "Second question"})
+        manager.add_message("conv_123", {"role": "assistant", "content": "Second answer"})
+
+        manager.add_message("conv_123", {"role": "user", "content": "Third question"})
+        manager.add_message("conv_123", {"role": "assistant", "content": "Third answer"})
+
+        history = manager.get_history("conv_123")
+        # max_messages=2 means 2 conversation turns (4 non-tool messages max)
+        # Tool messages are exempt from the count
+        non_tool_msgs = [m for m in history if not manager._is_tool_message(m)]
+        assert len(non_tool_msgs) <= 2
+
+    def test_trim_history_tool_exempt_from_count(self):
+        """Test that tool messages don't count toward max_messages limit."""
+        manager = ConversationHistoryManager(max_messages=2)
+        manager.add_message("conv_123", {"role": "user", "content": "Q1"})
+        manager.add_message("conv_123", {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {}}]})
+        manager.add_message("conv_123", {"role": "tool", "tool_call_id": "c1", "content": "r1"})
+        manager.add_message("conv_123", {"role": "assistant", "content": "A1"})
+        manager.add_message("conv_123", {"role": "user", "content": "Q2"})
+        manager.add_message("conv_123", {"role": "assistant", "content": "A2"})
+
+        history = manager.get_history("conv_123")
+        non_tool_msgs = [m for m in history if not manager._is_tool_message(m)]
+        # max_messages=2, tool messages exempt, so 2 non-tool messages remain
+        assert len(non_tool_msgs) == 2
+
+    def test_add_messages_batch(self):
+        """Test add_messages adds multiple messages in one call."""
+        manager = ConversationHistoryManager()
+        messages = [
+            {"role": "user", "content": "What's the weather?"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 25C"},
+            {"role": "assistant", "content": "It's sunny and 25C"},
+        ]
+        manager.add_messages("conv_123", messages)
+
+        assert len(manager._histories["conv_123"]) == 4
+        history = manager.get_history("conv_123")
+        assert len(history) == 4
+        assert history[0]["content"] == "What's the weather?"
+        assert history[3]["content"] == "It's sunny and 25C"
+
+    def test_add_messages_batch_empty_list(self):
+        """Test add_messages with empty list does nothing."""
+        manager = ConversationHistoryManager()
+        manager.add_messages("conv_123", [])
+
+        assert len(manager._histories) == 0
+
+    def test_add_messages_batch_empty_conversation_id(self):
+        """Test add_messages with empty conversation_id is ignored."""
+        manager = ConversationHistoryManager()
+        manager.add_messages("", [{"role": "user", "content": "Hello"}])
+
+        assert len(manager._histories) == 0
+
+    def test_get_history_preserves_tool_calls(self):
+        """Test get_history returns tool_calls field intact."""
+        manager = ConversationHistoryManager()
+        tool_calls = [
+            {
+                "id": "call_abc",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city": "London"}'},
+            }
+        ]
+        manager.add_message("conv_123", {"role": "assistant", "content": "", "tool_calls": tool_calls})
+        manager.add_message("conv_123", {"role": "tool", "tool_call_id": "call_abc", "content": "Rainy"})
+
+        history = manager.get_history("conv_123")
+        assert len(history) == 2
+        assert history[0]["tool_calls"] == tool_calls
+        assert history[1]["tool_call_id"] == "call_abc"
+        # timestamp should be stripped
+        assert "timestamp" not in history[0]
+        assert "timestamp" not in history[1]
+
+    def test_get_history_preserves_name_field(self):
+        """Test get_history preserves the name field when present."""
+        manager = ConversationHistoryManager()
+        manager.add_message("conv_123", {
+            "role": "user",
+            "content": "Hello",
+            "name": "alice",
+        })
+
+        history = manager.get_history("conv_123")
+        assert history[0]["name"] == "alice"
+
+    def test_strip_timestamp_preserves_tool_fields(self):
+        """Test _strip_timestamp removes timestamp but keeps tool fields."""
+        manager = ConversationHistoryManager()
+        msg = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {}}],
+            "timestamp": 12345,
+        }
+        stripped = manager._strip_timestamp(msg)
+
+        assert "timestamp" not in stripped
+        assert stripped["tool_calls"] == msg["tool_calls"]
+        assert stripped["role"] == "assistant"
+
+    def test_estimate_tokens_with_tool_calls(self):
+        """Test token estimation accounts for tool_calls content."""
+        manager = ConversationHistoryManager()
+        msg_with_tools = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": '{"location": "NYC", "units": "celsius"}'},
+                    }
+                ],
+            }
+        ]
+        msg_without_tools = [{"role": "assistant", "content": ""}]
+
+        tokens_with = manager.estimate_tokens(msg_with_tools)
+        tokens_without = manager.estimate_tokens(msg_without_tools)
+
+        # Tool calls should add to token count
+        assert tokens_with > tokens_without
+
+    def test_full_tool_call_turn_workflow(self):
+        """Test a complete tool call turn: user -> assistant(tool) -> tool -> assistant(text)."""
+        manager = ConversationHistoryManager()
+        manager.add_message("conv_123", {"role": "user", "content": "Turn on the living room light"})
+        manager.add_message("conv_123", {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_turn_on",
+                    "type": "function",
+                    "function": {
+                        "name": "ha_control",
+                        "arguments": '{"entity_id": "light.living_room", "state": "on"}',
+                    },
+                }
+            ],
+        })
+        manager.add_message("conv_123", {
+            "role": "tool",
+            "tool_call_id": "call_turn_on",
+            "content": '{"success": true}',
+        })
+        manager.add_message("conv_123", {"role": "assistant", "content": "I've turned on the living room light."})
+
+        history = manager.get_history("conv_123")
+        assert len(history) == 4
+        assert history[0]["role"] == "user"
+        assert history[1]["role"] == "assistant"
+        assert "tool_calls" in history[1]
+        assert history[2]["role"] == "tool"
+        assert history[2]["tool_call_id"] == "call_turn_on"
+        assert history[3]["content"] == "I've turned on the living room light."
+
+        # Check turn count: 2 turns (user question + assistant text response)
+        # Tool messages (assistant with tool_calls + tool result) are excluded
+        turns = manager._count_conversation_turns(
+            manager._histories["conv_123"]
+        )
+        assert turns == 2
+
+    def test_multiple_tool_calls_in_one_message(self):
+        """Test assistant message with multiple tool_calls in a single message."""
+        manager = ConversationHistoryManager()
+        manager.add_message("conv_123", {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": '{"city": "London"}'},
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'},
+                },
+            ],
+        })
+
+        history = manager.get_history("conv_123")
+        assert len(history) == 1
+        assert len(history[0]["tool_calls"]) == 2
+        assert history[0]["tool_calls"][0]["id"] == "call_1"
+        assert history[0]["tool_calls"][1]["id"] == "call_2"
+
+    def test_add_message_dict_format_simple(self):
+        """Test add_message with simple dict format (no tool calls)."""
+        manager = ConversationHistoryManager()
+        manager.add_message("conv_123", {"role": "user", "content": "Hello"})
+
+        assert len(manager._histories["conv_123"]) == 1
+        assert manager._histories["conv_123"][0]["role"] == "user"
+        assert manager._histories["conv_123"][0]["content"] == "Hello"
+
+    def test_add_message_dict_format_missing_role(self):
+        """Test add_message with dict missing 'role' is rejected."""
+        manager = ConversationHistoryManager()
+        manager.add_message("conv_123", {"content": "Hello"})
+
+        assert len(manager._histories) == 0
+
+    def test_add_message_dict_format_missing_content_non_tool(self):
+        """Test add_message with dict missing 'content' for non-tool is rejected."""
+        manager = ConversationHistoryManager()
+        manager.add_message("conv_123", {"role": "user"})
+
+        assert len(manager._histories) == 0

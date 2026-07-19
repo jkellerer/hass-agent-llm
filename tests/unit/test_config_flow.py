@@ -20,6 +20,7 @@ from custom_components.home_agent.const import (
     CONF_EXTERNAL_LLM_BASE_URL,
     CONF_EXTERNAL_LLM_ENABLED,
     CONF_EXTERNAL_LLM_MODEL,
+    CONF_HISTORY_RECORD_TOOL_CALLS,
     CONF_LLM_BACKEND,
     CONF_LLM_PROXY_HEADERS,
     CONF_MEMORY_ENABLED,
@@ -36,6 +37,7 @@ from custom_components.home_agent.const import (
     CONF_VECTOR_DB_HOST,
     CONF_VECTOR_DB_PORT,
     CONTEXT_MODE_VECTOR_DB,
+    DEFAULT_HISTORY_RECORD_TOOL_CALLS,
     DEFAULT_PROMPT_INCLUDE_LABELS,
     DEFAULT_SESSION_PERSISTENCE_ENABLED,
     DEFAULT_SESSION_TIMEOUT,
@@ -562,6 +564,55 @@ class TestHomeAgentOptionsFlow:
             if hasattr(key, "schema") and key.schema == CONF_SESSION_TIMEOUT:
                 # The default should show 120 minutes (7200 seconds / 60)
                 assert key.default() == 120
+
+    async def test_history_record_tool_calls_in_form(self, mock_config_entry, mock_hass):
+        """Test that history_record_tool_calls is in the history_settings form."""
+        options_flow = HomeAgentOptionsFlow(mock_config_entry)
+        options_flow.hass = mock_hass
+
+        # Get the history settings form
+        result = await options_flow.async_step_history_settings()
+
+        # Verify the form is shown
+        assert result["type"] == FlowResultType.FORM
+        assert result["step_id"] == "history_settings"
+
+        # Verify history_record_tool_calls option is in the schema
+        schema_keys = list(result["data_schema"].schema.keys())
+        record_tool_calls_key = None
+
+        for key in schema_keys:
+            if hasattr(key, "schema") and key.schema == CONF_HISTORY_RECORD_TOOL_CALLS:
+                record_tool_calls_key = key
+                break
+
+        assert (
+            record_tool_calls_key is not None
+        ), "history_record_tool_calls option not found in schema"
+        # The default should be True (backward compatible)
+        assert record_tool_calls_key.default() == DEFAULT_HISTORY_RECORD_TOOL_CALLS
+        assert DEFAULT_HISTORY_RECORD_TOOL_CALLS is True
+
+    async def test_history_record_tool_calls_saves_value(self, mock_config_entry, mock_hass):
+        """Test that history_record_tool_calls value is saved when form is submitted."""
+        options_flow = HomeAgentOptionsFlow(mock_config_entry)
+        options_flow.hass = mock_hass
+
+        # Submit form with history_record_tool_calls set to False
+        user_input = {
+            "history_enabled": True,
+            "history_max_messages": 10,
+            "history_max_tokens": 1000,
+            CONF_HISTORY_RECORD_TOOL_CALLS: False,
+            CONF_SESSION_PERSISTENCE_ENABLED: True,
+            CONF_SESSION_TIMEOUT: 60,
+        }
+
+        result = await options_flow.async_step_history_settings(user_input)
+
+        # Verify the entry is created successfully and value is saved
+        assert result["type"] == FlowResultType.CREATE_ENTRY
+        assert result["data"][CONF_HISTORY_RECORD_TOOL_CALLS] is False
 
     async def test_context_settings_success(self, mock_config_entry, mock_hass):
         """Test successful context settings update."""

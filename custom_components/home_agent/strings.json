@@ -72,12 +72,14 @@
           "history_enabled": "Enable Conversation History",
           "history_max_messages": "Max Messages",
           "history_max_tokens": "Max Tokens",
+          "history_record_tool_calls": "Record Tool Calls",
           "history_persist": "Persist Across Restarts"
         },
         "data_description": {
           "history_enabled": "Include previous conversation turns in LLM context",
           "history_max_messages": "Maximum number of conversation turns to retain (0 for unlimited)",
           "history_max_tokens": "Token-based limit for history (0 for unlimited)",
+          "history_record_tool_calls": "Store tool calls and results in history (disable to save tokens)",
           "history_persist": "Save conversation history across Home Assistant restarts"
         }
       },

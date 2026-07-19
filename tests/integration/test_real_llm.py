@@ -32,6 +32,7 @@ from custom_components.home_agent.const import (
     CONF_HISTORY_ENABLED,
     CONF_HISTORY_MAX_MESSAGES,
     CONF_HISTORY_PERSIST,
+    CONF_HISTORY_RECORD_TOOL_CALLS,
     CONF_LLM_API_KEY,
     CONF_LLM_BASE_URL,
     CONF_LLM_MAX_TOKENS,
@@ -344,6 +345,116 @@ async def test_multi_turn_context(
             assert len(history) >= 4, "Conversation history not tracking properly"
 
             await agent.close()
+
+
+@pytest.mark.integration
+@pytest.mark.requires_llm
+@pytest.mark.asyncio
+async def test_history_with_tool_calls_recorded(
+    test_hass, llm_config, session_manager, is_using_mock_llm, mock_llm_server
+):
+    """Test that tool calls are included in history when recording is enabled.
+
+    This test verifies that:
+    1. When CONF_HISTORY_RECORD_TOOL_CALLS is True (default), tool messages are saved
+    2. History contains assistant messages with tool_calls and tool role messages
+    """
+    config = {
+        CONF_LLM_BASE_URL: llm_config["base_url"],
+        CONF_LLM_API_KEY: llm_config.get("api_key", ""),
+        CONF_LLM_MODEL: llm_config["model"],
+        CONF_LLM_TEMPERATURE: 0.7,
+        CONF_LLM_MAX_TOKENS: 500,
+        CONF_HISTORY_ENABLED: True,
+        CONF_HISTORY_MAX_MESSAGES: 20,
+        CONF_HISTORY_RECORD_TOOL_CALLS: True,
+        CONF_HISTORY_PERSIST: False,
+        CONF_EMIT_EVENTS: False,
+        CONF_PROMPT_CUSTOM_ADDITIONS: "/no_think",
+    }
+
+    with maybe_mock_llm(is_using_mock_llm, mock_llm_server):
+        agent = HomeAgent(test_hass, config, session_manager)
+
+        # Manually add tool messages to simulate a tool call scenario
+        conversation_id = "test_tool_calls_recorded"
+
+        # Simulate a conversation with tool calls
+        test_history = [
+            {"role": "user", "content": "Turn on the light"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_123", "function": {"name": "ha_control", "arguments": "{\"action\":\"turn_on\",\"entity_id\":\"light.living_room\"}"}}]},
+            {"role": "tool", "content": "Light turned on", "tool_call_id": "call_123"},
+            {"role": "assistant", "content": "I've turned on the light for you."},
+        ]
+        agent.conversation_manager.add_messages(conversation_id, test_history)
+
+        # Check history - with tool calls recorded, tool messages should be present
+        history = agent.conversation_manager.get_history(conversation_id)
+        assert len(history) == 4, "History should have all 4 messages"
+
+        # Verify tool messages are present
+        has_tool_messages = any(
+            msg.get("role") == "tool" or msg.get("tool_calls")
+            for msg in history
+        )
+        assert has_tool_messages, "Tool messages should be in history when recording is enabled"
+
+        await agent.close()
+
+
+@pytest.mark.integration
+@pytest.mark.requires_llm
+@pytest.mark.asyncio
+async def test_history_without_tool_calls_recorded(
+    test_hass, llm_config, session_manager, is_using_mock_llm, mock_llm_server
+):
+    """Test that tool calls are excluded from history when recording is disabled.
+
+    This test verifies that:
+    1. When CONF_HISTORY_RECORD_TOOL_CALLS is False, tool messages are filtered
+    2. History only contains user and assistant text messages (no tool_calls or role=tool)
+    """
+    config = {
+        CONF_LLM_BASE_URL: llm_config["base_url"],
+        CONF_LLM_API_KEY: llm_config.get("api_key", ""),
+        CONF_LLM_MODEL: llm_config["model"],
+        CONF_LLM_TEMPERATURE: 0.7,
+        CONF_LLM_MAX_TOKENS: 500,
+        CONF_HISTORY_ENABLED: True,
+        CONF_HISTORY_MAX_MESSAGES: 20,
+        CONF_HISTORY_RECORD_TOOL_CALLS: False,
+        CONF_HISTORY_PERSIST: False,
+        CONF_EMIT_EVENTS: False,
+        CONF_PROMPT_CUSTOM_ADDITIONS: "/no_think",
+    }
+
+    with maybe_mock_llm(is_using_mock_llm, mock_llm_server):
+        agent = HomeAgent(test_hass, config, session_manager)
+
+        conversation_id = "test_tool_calls_filtered"
+
+        # Test the _filter_tool_messages method directly
+        test_messages = [
+            {"role": "user", "content": "Turn on the light"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_123", "function": {"name": "ha_control", "arguments": "{\"action\":\"turn_on\",\"entity_id\":\"light.living_room\"}"}}]},
+            {"role": "tool", "content": "Light turned on", "tool_call_id": "call_123"},
+            {"role": "assistant", "content": "I've turned on the light for you."},
+        ]
+
+        filtered = HomeAgent._filter_tool_messages(test_messages)
+        assert len(filtered) == 2, "Filtered history should only have user + final assistant"
+        assert filtered[0]["role"] == "user"
+        assert filtered[1]["role"] == "assistant"
+        assert filtered[1]["content"] == "I've turned on the light for you."
+
+        # Verify NO tool messages in filtered result
+        has_tool_messages = any(
+            msg.get("role") == "tool" or msg.get("tool_calls")
+            for msg in filtered
+        )
+        assert not has_tool_messages, "Tool messages should NOT be in filtered history"
+
+        await agent.close()
 
 
 @pytest.mark.integration

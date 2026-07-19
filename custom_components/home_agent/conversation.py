@@ -26,7 +26,9 @@ _LOGGER = logging.getLogger(__name__)
 CHARS_PER_TOKEN = 4
 
 # Storage version for migrations
-STORAGE_VERSION_HISTORY = 1
+# v1: simple {"role", "content", "timestamp"} messages
+# v2: full OpenAI format with tool_calls, tool_call_id, name support
+STORAGE_VERSION_HISTORY = 2
 
 # Default debounce delay for saving (seconds)
 DEFAULT_SAVE_DELAY = 5
@@ -344,8 +346,9 @@ class ConversationHistoryManager:
             Migrated data in current format
 
         Note:
-            Currently only version 1 exists, so no migrations are needed.
-            This method is a placeholder for future version migrations.
+            v1 → v2: Simple {"role", "content"} messages are forward-compatible.
+            v2 adds support for tool_calls, tool_call_id, and name fields.
+            Existing v1 messages remain valid as a subset of v2 format.
         """
         _LOGGER.info(
             "Migrating conversation history storage from version %d to %d",
@@ -353,9 +356,8 @@ class ConversationHistoryManager:
             STORAGE_VERSION_HISTORY,
         )
 
-        # Version 1 is the only version currently, no migration needed
         if old_version == 1:
-            return data
+            data = self._migrate_v1_to_v2(data)
 
         # Future migrations would go here
         # if old_version == 2:
@@ -363,25 +365,148 @@ class ConversationHistoryManager:
         # if old_version == 3:
         #     data = migrate_v3_to_v4(data)
 
-        _LOGGER.warning(
-            "No migration path from version %d to %d, returning data as-is",
-            old_version,
-            STORAGE_VERSION_HISTORY,
+        if data["version"] < STORAGE_VERSION_HISTORY:
+            _LOGGER.warning(
+                "No migration path from version %d to %d, returning data as-is",
+                old_version,
+                STORAGE_VERSION_HISTORY,
+            )
+        return data
+    
+    def _migrate_v1_to_v2(self, data: dict[str, Any]) -> dict[str, Any]:
+        # v1 messages only have {"role", "content", "timestamp"}
+        # These are a valid subset of v2 format — no transformation needed.
+        # Just update the version number.
+        data["version"] = STORAGE_VERSION_HISTORY
+        _LOGGER.debug(
+            "Migrated %d conversations from v1 to v2 (no data transformation needed)",
+            len(data.get("conversations", {})),
         )
         return data
 
-    def add_message(self, conversation_id: str, role: str, content: str) -> None:
-        """Add a message to conversation history.
+    @staticmethod
+    def _is_tool_message(msg: dict[str, Any]) -> bool:
+        """Check if a message is a tool-related message (tool result or assistant with tool_calls).
+
+        Tool messages are exempt from max_messages counting since they are part of
+        the execution chain for a single conversation turn.
+
+        Args:
+            msg: Message dictionary
+
+        Returns:
+            True if the message is a tool result or an assistant message with tool_calls
+        """
+        if msg.get("role") == "tool":
+            return True
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            return True
+        return False
+
+    def _count_conversation_turns(self, messages: list[dict[str, Any]]) -> int:
+        """Count the number of conversation turns (user/assistant text pairs), excluding tool messages.
+
+        Args:
+            messages: List of message dictionaries
+
+        Returns:
+            Number of non-tool messages (user messages + assistant text responses)
+        """
+        return sum(1 for msg in messages if not self._is_tool_message(msg))
+
+    def _trim_history(self, conversation_id: str) -> None:
+        """Trim conversation history to stay within max_messages limit.
+
+        Tool messages (role="tool" or assistant with tool_calls) are exempt from
+        the count. Only user messages and assistant text responses count toward
+        the max_messages limit. When trimming, complete turns are removed from
+        the oldest end, preserving tool message chains intact.
 
         Args:
             conversation_id: Unique identifier for the conversation
-            role: Message role (typically "user" or "assistant")
-            content: Message content
+        """
+        if self._max_messages is None:
+            return
+
+        history = self._histories[conversation_id]
+        turn_count = self._count_conversation_turns(history)
+
+        if turn_count <= self._max_messages:
+            return
+
+        # Remove turns from the oldest end, preserving tool message chains.
+        # We remove messages from the front until turn_count is within limits.
+        messages_to_remove = 0
+        for msg in history:
+            if self._is_tool_message(msg):
+                # Skip tool messages — they stay attached to their turn
+                continue
+            if turn_count - messages_to_remove > self._max_messages:
+                messages_to_remove += 1
+            else:
+                break
+
+        # Now find the actual index to cut at (skipping tool messages that
+        # belong to turns we're keeping)
+        non_tool_removed = 0
+        cut_index = 0
+        for i, msg in enumerate(history):
+            if not self._is_tool_message(msg):
+                non_tool_removed += 1
+                if non_tool_removed > messages_to_remove:
+                    cut_index = i
+                    break
+            cut_index = i + 1
+
+        if cut_index > 0:
+            del self._histories[conversation_id][:cut_index]
+            _LOGGER.debug(
+                "Trimmed conversation %s by %d messages (%d turns removed) to stay within limit",
+                conversation_id,
+                cut_index,
+                messages_to_remove,
+            )
+
+    def add_message(
+        self,
+        conversation_id: str,
+        message: dict[str, Any] | str,
+        content: str | None = None,
+    ) -> None:
+        """Add a message to conversation history.
+
+        Supports two calling conventions for backward compatibility:
+
+        1. Full OpenAI dict format (new):
+            >>> manager.add_message("conv_123", {"role": "user", "content": "Hello"})
+
+        2. Simple role/content (legacy):
+            >>> manager.add_message("conv_123", "user", "Hello")
+
+        Args:
+            conversation_id: Unique identifier for the conversation
+            message: Either a message dict (with 'role' and 'content') or a role string
+                     for legacy calls. Dict may include 'tool_calls', 'tool_call_id', 'name'.
+            content: Content string (only used when message is a role string, for legacy calls)
 
         Example:
-            >>> manager = ConversationHistoryManager()
-            >>> manager.add_message("conv_123", "user", "Turn on the lights")
-            >>> manager.add_message("conv_123", "assistant", "I've turned on the lights")
+            Simple text message:
+                >>> manager.add_message("conv_123", {"role": "user", "content": "Turn on the lights"})
+                >>> manager.add_message("conv_123", "user", "Turn on the lights")  # legacy
+
+            Assistant message with tool calls:
+                >>> manager.add_message("conv_123", {
+                ...     "role": "assistant",
+                ...     "content": "",
+                ...     "tool_calls": [{"id": "call_xxx", "type": "function", "function": {...}}]
+                ... })
+
+            Tool result message:
+                >>> manager.add_message("conv_123", {
+                ...     "role": "tool",
+                ...     "tool_call_id": "call_xxx",
+                ...     "content": '{"success": true}'
+                ... })
 
         Note:
             If persistence is enabled, this will trigger a debounced save to storage.
@@ -390,52 +515,137 @@ class ConversationHistoryManager:
             _LOGGER.warning("Attempted to add message with empty conversation_id")
             return
 
-        if not content:
+        # Handle legacy (conversation_id, role, content) signature
+        if isinstance(message, str):
+            role = message
+            msg_content = content
+            if not msg_content:
+                _LOGGER.warning("Attempted to add empty message to conversation %s", conversation_id)
+                return
+            message = {"role": role, "content": msg_content}
+        elif not isinstance(message, dict):
+            _LOGGER.warning("Message must be a dictionary or role string, got %s", type(message))
+            return
+
+        if "role" not in message:
+            _LOGGER.warning("Message missing 'role' field: %s", message)
+            return
+
+        # Tool messages, tool results, and assistant messages with tool_calls may have empty content — that's valid
+        has_content = message.get("content")
+        has_tool_calls = message.get("tool_calls")
+        is_tool = message.get("role") == "tool"
+        if not has_content and not has_tool_calls and not is_tool:
             _LOGGER.warning("Attempted to add empty message to conversation %s", conversation_id)
             return
 
-        message = {
-            "role": role,
-            "content": content,
-            "timestamp": int(time.time()),
-        }
+        msg_with_timestamp = dict(message)
+        msg_with_timestamp["timestamp"] = int(time.time())
 
-        self._histories[conversation_id].append(message)
+        self._histories[conversation_id].append(msg_with_timestamp)
 
-        # Trim to max_messages to prevent unbounded growth
-        if (
-            self._max_messages is not None
-            and len(self._histories[conversation_id]) > self._max_messages
-        ):
-            excess = len(self._histories[conversation_id]) - self._max_messages
-            del self._histories[conversation_id][:excess]
-            _LOGGER.debug(
-                "Trimmed conversation %s by %d messages to stay within limit",
-                conversation_id,
-                excess,
-            )
+        # Trim to max_messages to prevent unbounded growth (tool messages exempt)
+        self._trim_history(conversation_id)
 
         _LOGGER.debug(
-            "Added %s message to conversation %s (now %d messages)",
-            role,
+            "Added %s message to conversation %s (now %d messages, %d turns)",
+            message.get("role"),
             conversation_id,
             len(self._histories[conversation_id]),
+            self._count_conversation_turns(self._histories[conversation_id]),
         )
 
         # Trigger debounced save if persistence is enabled
         if self._persist and self._hass:
             asyncio.create_task(self._debounced_save())
 
+    def add_messages(self, conversation_id: str, messages: list[dict[str, Any]]) -> None:
+        """Add multiple messages to conversation history in one call.
+
+        Used to save a complete conversation turn including tool calls and results
+        in the correct order.
+
+        Args:
+            conversation_id: Unique identifier for the conversation
+            messages: List of message dictionaries (OpenAI format)
+
+        Example:
+            >>> manager.add_messages("conv_123", [
+            ...     {"role": "user", "content": "What's the weather?"},
+            ...     {"role": "assistant", "content": "", "tool_calls": [...]},
+            ...     {"role": "tool", "tool_call_id": "call_x", "content": "Sunny, 25°C"},
+            ...     {"role": "assistant", "content": "It's sunny and 25°C"},
+            ... ])
+
+        Note:
+            If persistence is enabled, a single debounced save is triggered after
+            all messages are added.
+        """
+        if not conversation_id:
+            _LOGGER.warning("Attempted to add messages with empty conversation_id")
+            return
+
+        if not messages:
+            return
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                _LOGGER.warning("Skipping invalid message: %s", msg)
+                continue
+
+            if "role" not in msg:
+                _LOGGER.warning("Skipping message missing 'role': %s", msg)
+                continue
+
+            msg_with_timestamp = dict(msg)
+            msg_with_timestamp["timestamp"] = int(time.time())
+            self._histories[conversation_id].append(msg_with_timestamp)
+
+        # Trim once after all messages are added
+        self._trim_history(conversation_id)
+
+        _LOGGER.debug(
+            "Added %d messages to conversation %s (now %d messages, %d turns)",
+            len(messages),
+            conversation_id,
+            len(self._histories[conversation_id]),
+            self._count_conversation_turns(self._histories[conversation_id]),
+        )
+
+        # Trigger debounced save if persistence is enabled
+        if self._persist and self._hass:
+            asyncio.create_task(self._debounced_save())
+
+    def _strip_timestamp(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Return a copy of the message without the internal timestamp field.
+
+        Preserves all OpenAI-compatible fields: role, content, tool_calls,
+        tool_call_id, name — anything that the LLM API expects.
+
+        Args:
+            msg: Message dictionary (may contain 'timestamp')
+
+        Returns:
+            Message dict without 'timestamp'
+        """
+        result = dict(msg)
+        result.pop("timestamp", None)
+        return result
+
     def get_history(
         self,
         conversation_id: str,
         max_messages: int | None = None,
         max_tokens: int | None = None,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         """Get conversation history with optional limits.
 
         Retrieves recent conversation history, applying message and token limits.
         If both limits are specified, the more restrictive one is applied.
+
+        Returns full OpenAI-format messages including tool_calls, tool_call_id,
+        and name fields (when present). Only the internal 'timestamp' field is
+        stripped.
 
         Args:
             conversation_id: Unique identifier for the conversation
@@ -443,13 +653,13 @@ class ConversationHistoryManager:
             max_tokens: Override default max tokens limit (None = use default)
 
         Returns:
-            List of message dictionaries with 'role' and 'content' keys,
+            List of message dictionaries in OpenAI format,
             in chronological order (oldest first)
 
         Example:
             >>> manager = ConversationHistoryManager(max_messages=10)
-            >>> manager.add_message("conv_123", "user", "Hello")
-            >>> manager.add_message("conv_123", "assistant", "Hi!")
+            >>> manager.add_message("conv_123", {"role": "user", "content": "Hello"})
+            >>> manager.add_message("conv_123", {"role": "assistant", "content": "Hi!"})
             >>> history = manager.get_history("conv_123")
             >>> len(history)
             2
@@ -460,25 +670,40 @@ class ConversationHistoryManager:
 
         history = self._histories[conversation_id]
 
-        # Apply message limit
+        # Apply message limit (tool messages are exempt from the count)
         effective_max_messages = max_messages if max_messages is not None else self._max_messages
-        if effective_max_messages is not None and len(history) > effective_max_messages:
-            history = history[-effective_max_messages:]
-            _LOGGER.debug(
-                "Truncated conversation %s to %d messages (from %d)",
-                conversation_id,
-                effective_max_messages,
-                len(self._histories[conversation_id]),
-            )
+        if effective_max_messages is not None:
+            turn_count = self._count_conversation_turns(history)
+            if turn_count > effective_max_messages:
+                # Trim from the front, preserving tool message chains
+                turns_to_remove = turn_count - effective_max_messages
+                non_tool_removed = 0
+                cut_index = 0
+                for i, msg in enumerate(history):
+                    if not self._is_tool_message(msg):
+                        non_tool_removed += 1
+                        if non_tool_removed > turns_to_remove:
+                            cut_index = i
+                            break
+                    cut_index = i + 1
+
+                if cut_index > 0:
+                    history = history[cut_index:]
+                    _LOGGER.debug(
+                        "Truncated conversation %s to %d turns (from %d, removed %d messages)",
+                        conversation_id,
+                        self._count_conversation_turns(history),
+                        turn_count,
+                        cut_index,
+                    )
 
         # Apply token limit
         effective_max_tokens = max_tokens if max_tokens is not None else self._max_tokens
         if effective_max_tokens is not None:
             history = self._truncate_by_tokens(history, effective_max_tokens)
 
-        # Filter out timestamp to maintain OpenAI compatibility
-        # Return only 'role' and 'content' fields
-        return [{"role": msg["role"], "content": msg["content"]} for msg in history]
+        # Strip internal timestamp to maintain OpenAI compatibility
+        return [self._strip_timestamp(msg) for msg in history]
 
     def clear_history(self, conversation_id: str) -> None:
         """Clear history for a specific conversation.
@@ -569,15 +794,18 @@ class ConversationHistoryManager:
         """
         return len(self._histories.get(conversation_id, []))
 
-    def estimate_tokens(self, messages: list[dict[str, str]]) -> int:
+    def estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
         """Estimate token count for a list of messages.
 
         Uses a conservative estimate of ~4 characters per token, which works
         across most models. For more accurate token counting, consider using
         a model-specific tokenizer (e.g., tiktoken for OpenAI models).
 
+        Accounts for tool_calls, tool_call_id, and name fields in addition
+        to role and content.
+
         Args:
-            messages: List of message dictionaries with 'role' and 'content'
+            messages: List of message dictionaries (OpenAI format)
 
         Returns:
             Estimated token count
@@ -588,14 +816,33 @@ class ConversationHistoryManager:
             >>> manager.estimate_tokens(messages) > 0
             True
         """
+        import json
+
         total_chars = 0
         for message in messages:
             # Count role characters
             total_chars += len(message.get("role", ""))
             # Count content characters
-            total_chars += len(message.get("content", ""))
+            total_chars += len(str(message.get("content", "")))
             # Add overhead for message structure (role/content keys, etc.)
             total_chars += 20
+
+            # Account for tool_calls
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                try:
+                    total_chars += len(json.dumps(tool_calls))
+                except (TypeError, ValueError):
+                    total_chars += len(str(tool_calls))
+
+            # Account for tool_call_id and name (tool result messages)
+            tool_call_id = message.get("tool_call_id")
+            if tool_call_id:
+                total_chars += len(tool_call_id) + 10  # field name overhead
+
+            name = message.get("name")
+            if name:
+                total_chars += len(name) + 10  # field name overhead
 
         estimated_tokens = total_chars // CHARS_PER_TOKEN
 
@@ -609,8 +856,8 @@ class ConversationHistoryManager:
         return estimated_tokens
 
     def _truncate_by_tokens(
-        self, history: list[dict[str, str]], max_tokens: int
-    ) -> list[dict[str, str]]:
+        self, history: list[dict[str, Any]], max_tokens: int
+    ) -> list[dict[str, Any]]:
         """Truncate history to fit within token limit.
 
         Removes oldest messages until the history fits within max_tokens.

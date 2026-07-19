@@ -48,6 +48,7 @@ from .const import (
     CONF_HISTORY_ENABLED,
     CONF_HISTORY_MAX_MESSAGES,
     CONF_HISTORY_MAX_TOKENS,
+    CONF_HISTORY_RECORD_TOOL_CALLS,
     CONF_LLM_API_KEY,
     CONF_LLM_BACKEND,
     CONF_LLM_BASE_URL,
@@ -106,6 +107,7 @@ from .const import (
     DEFAULT_HISTORY_ENABLED,
     DEFAULT_HISTORY_MAX_MESSAGES,
     DEFAULT_HISTORY_MAX_TOKENS,
+    DEFAULT_HISTORY_RECORD_TOOL_CALLS,
     DEFAULT_LLM_KEEP_ALIVE,
     DEFAULT_LLM_MODEL,
     DEFAULT_MAX_CONTEXT_TOKENS,
@@ -913,6 +915,15 @@ class HomeAgentOptionsFlow(config_entries.OptionsFlow):
                             current_data.get(CONF_HISTORY_MAX_TOKENS, DEFAULT_HISTORY_MAX_TOKENS),
                         ),
                     ): vol.All(vol.Coerce(int), vol.Range(min=100, max=50000)),
+                    vol.Required(
+                        CONF_HISTORY_RECORD_TOOL_CALLS,
+                        default=current_options.get(
+                            CONF_HISTORY_RECORD_TOOL_CALLS,
+                            current_data.get(
+                                CONF_HISTORY_RECORD_TOOL_CALLS, DEFAULT_HISTORY_RECORD_TOOL_CALLS
+                            ),
+                        ),
+                    ): bool,
                     vol.Required(
                         CONF_SESSION_PERSISTENCE_ENABLED,
                         default=current_options.get(

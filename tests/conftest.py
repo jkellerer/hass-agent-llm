@@ -1,5 +1,31 @@
 """Shared test fixtures for Home Agent."""
 
+# Mock missing hassil submodules and home_assistant_intents before any Home Assistant imports.
+# The released hassil (3.10.0) and home_assistant_intents packages are incompatible
+# with the installed Home Assistant version - missing modules: hassil.fuzzy, hassil.ngram,
+# and FuzzyConfig from home_assistant_intents.
+import sys
+from unittest.mock import MagicMock as _MagicMock
+
+# Mock hassil submodules
+for _mod in ["hassil.fuzzy", "hassil.ngram", "hassil.training"]:
+    _mock = _MagicMock()
+    if _mod == "hassil.fuzzy":
+        _mock.FuzzyNgramMatcher = _MagicMock
+        _mock.SlotCombinationInfo = _MagicMock
+    elif _mod == "hassil.ngram":
+        _mock.Sqlite3NgramModel = _MagicMock
+    sys.modules[_mod] = _mock
+
+# Mock FuzzyConfig in home_assistant_intents
+_hai = sys.modules.get("home_assistant_intents")
+if _hai is None:
+    _hai = _MagicMock()
+    _hai.FuzzyConfig = _MagicMock
+    sys.modules["home_assistant_intents"] = _hai
+else:
+    _hai.FuzzyConfig = _MagicMock
+
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
