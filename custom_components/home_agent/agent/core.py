@@ -904,7 +904,7 @@ class HomeAgent(
         user_message = self._preprocess_user_message(user_input.text)
         device_id = user_input.device_id
         user_id = user_input.context.user_id if user_input.context else None
-        tools_history_string = ""
+
         # Get or create persistent conversation ID for voice interactions
         conversation_id = user_input.conversation_id
         if conversation_id is None:
@@ -1038,7 +1038,6 @@ class HomeAgent(
 
         # Add current user message
         messages.append({"role": "user", "content": user_message})
-        _LOGGER.debug("Messages: %s", messages)
 
         # Tool calling loop (max iterations to prevent infinite loops)
         max_iterations = self.config.get(
@@ -1158,9 +1157,8 @@ class HomeAgent(
                         metrics["tool_calls"] += len(content_item.tool_calls)
 
                         # Add tool calls to message
-                        msg["tool_calls"] = []
-                        for tc in content_item.tool_calls:
-                            tool_call_dict = {
+                        msg["tool_calls"] = [
+                            {
                                 "id": tc.id,
                                 "type": "function",
                                 "function": {
@@ -1168,11 +1166,8 @@ class HomeAgent(
                                     "arguments": json.dumps(tc.tool_args),
                                 },
                             }
-                            msg["tool_calls"].append(tool_call_dict)
-                            tools_history_string += json.dumps(tool_call_dict)
-                        # Add Tool Call to ConversationHistory.
-                        
-                        
+                            for tc in content_item.tool_calls
+                        ]
 
                     messages.append(msg)
 
@@ -1271,15 +1266,8 @@ class HomeAgent(
 
             self.conversation_manager.add_message(conversation_id, "user", user_message)
             if final_response:
-                if tools_history_string:
-                    self.conversation_manager.add_message(
-                        conversation_id,
-                        "tool",
-                        tools_history_string,
-                    )
-                self.conversation_manager.add_message(
-                    conversation_id, "assistant", final_response
-                )
+                self.conversation_manager.add_message(conversation_id, "assistant", final_response)
+
         # Extract and store memories if enabled (fire and forget)
         if self.config.get(CONF_MEMORY_EXTRACTION_ENABLED, DEFAULT_MEMORY_EXTRACTION_ENABLED):
             # Extract final response for memory extraction
