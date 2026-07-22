@@ -617,7 +617,7 @@ class ServiceCustomTool(BaseTool):
                         rendered_ids: list[str] = []
                         for entity_id in entity_ids:
                             if isinstance(entity_id, str):
-                                rendered_ids.append(await self._render_template(entity_id, kwargs))
+                                rendered_ids.append(str(await self._render_template(entity_id, kwargs)))
                             else:
                                 rendered_ids.append(str(entity_id))
                         target["entity_id"] = rendered_ids
@@ -708,7 +708,7 @@ class ServiceCustomTool(BaseTool):
         self,
         template_str: str,
         variables: dict[str, Any],
-    ) -> str:
+    ) -> Any:
         """Render a template string with variables.
 
         Supports Home Assistant template syntax including secrets.
@@ -736,9 +736,7 @@ class ServiceCustomTool(BaseTool):
             template = Template(template_str, self.hass)
 
             # Render with provided variables
-            rendered = template.async_render(variables)
-
-            return str(rendered)
+            return template.async_render(variables)
 
         except Exception as err:
             raise ValidationError(f"Failed to render template '{template_str}': {err}") from err
