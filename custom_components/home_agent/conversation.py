@@ -17,7 +17,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 
-from .const import EVENT_HISTORY_SAVED, HISTORY_STORAGE_KEY
+from .const import (
+    DEFAULT_HISTORY_IDLE_THRESHOLD,
+    DEFAULT_HISTORY_MAX_MESSAGES,
+    DEFAULT_HISTORY_MIN_MESSAGES,
+    EVENT_HISTORY_SAVED,
+    HISTORY_STORAGE_KEY,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,8 +60,10 @@ class ConversationHistoryManager:
 
     def __init__(
         self,
-        max_messages: int = 10,
+        max_messages: int = DEFAULT_HISTORY_MAX_MESSAGES,
+        min_messages: int = DEFAULT_HISTORY_MIN_MESSAGES,
         max_tokens: int | None = None,
+        idle_threshold: int = DEFAULT_HISTORY_IDLE_THRESHOLD,
         hass: HomeAssistant | None = None,
         persist: bool = False,
         storage_key: str = HISTORY_STORAGE_KEY,
@@ -65,7 +73,9 @@ class ConversationHistoryManager:
 
         Args:
             max_messages: Maximum number of messages to retain per conversation
+            min_messages: Minimum messages to retain (stable floor for token caching)
             max_tokens: Maximum token count for conversation history (None = no limit)
+            idle_threshold: Seconds of inactivity before eviction is allowed (0 = always allow)
             hass: Home Assistant instance (required for persistence)
             persist: Enable persistent storage across restarts
             storage_key: Storage key for persistence (default: from const.py)
@@ -73,7 +83,9 @@ class ConversationHistoryManager:
         """
         self._histories: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._max_messages = max_messages
+        self._min_messages = min_messages
         self._max_tokens = max_tokens
+        self._idle_threshold = idle_threshold
         self._hass = hass
         self._persist = persist
         self._storage_key = storage_key
@@ -105,10 +117,12 @@ class ConversationHistoryManager:
                 )
 
         _LOGGER.debug(
-            "Initialized ConversationHistoryManager with max_messages=%d, max_tokens=%s, "
-            "persist=%s, save_delay=%ds",
+            "Initialized ConversationHistoryManager with max_messages=%d, min_messages=%d, "
+            "max_tokens=%s, idle_threshold=%ds, persist=%s, save_delay=%ds",
             max_messages,
+            min_messages,
             max_tokens,
+            idle_threshold,
             persist,
             save_delay,
         )
@@ -414,58 +428,242 @@ class ConversationHistoryManager:
         """
         return sum(1 for msg in messages if not self._is_tool_message(msg))
 
-    def _trim_history(self, conversation_id: str) -> None:
-        """Trim conversation history to stay within max_messages limit.
-
-        Tool messages (role="tool" or assistant with tool_calls) are exempt from
-        the count. Only user messages and assistant text responses count toward
-        the max_messages limit. When trimming, complete turns are removed from
-        the oldest end, preserving tool message chains intact.
+    def _get_last_turn_time(self, conversation_id: str) -> float:
+        """Get the timestamp of the last non-tool message in a conversation.
 
         Args:
             conversation_id: Unique identifier for the conversation
+
+        Returns:
+            Unix timestamp of the last non-tool message, or 0 if no history
+        """
+        history = self._histories.get(conversation_id, [])
+        for msg in reversed(history):
+            if not self._is_tool_message(msg):
+                return msg.get("timestamp", 0)
+        return 0
+
+    def _is_conversation_idle(self, conversation_id: str) -> bool:
+        """Check if a conversation has been idle for longer than the idle threshold.
+
+        Args:
+            conversation_id: Unique identifier for the conversation
+
+        Returns:
+            True if the last turn is older than idle_threshold seconds,
+            or if idle_threshold is 0 (always allow eviction)
+        """
+        if self._idle_threshold <= 0:
+            return True  # Always allow eviction if threshold is disabled
+        last_turn_time = self._get_last_turn_time(conversation_id)
+        if last_turn_time == 0:
+            return True  # No history means idle
+        return (time.time() - last_turn_time) >= self._idle_threshold
+
+    def _trim_history(self, conversation_id: str, was_idle: bool | None = None) -> bool:
+        """Trim conversation history using idle-based eviction and token limits.
+
+        Tool messages (role="tool" or assistant with tool_calls) are exempt from
+        the count. Only user messages and assistant text responses count toward
+        the max_messages limit.
+
+        Eviction policy:
+        - If turn_count <= max_messages: NO eviction (stable prefix preserved)
+        - If turn_count > max_messages AND conversation was active: DON'T evict
+          (let active conversations grow beyond max temporarily)
+        - If turn_count > max_messages AND conversation was idle: evict to min_messages
+        - If token count > max_tokens: evict to max_messages first, then if still
+          over limit, continue evicting below min_messages until tokens fit
+
+        Args:
+            conversation_id: Unique identifier for the conversation
+            was_idle: Pre-computed idle state captured BEFORE new messages were added.
+                      If None (default), idle state is computed from current history.
+
+        Returns:
+            True if eviction occurred, False otherwise
         """
         if self._max_messages is None:
-            return
+            return False
 
         history = self._histories[conversation_id]
         turn_count = self._count_conversation_turns(history)
+        evicted = False
 
-        if turn_count <= self._max_messages:
-            return
+        # --- Phase 1: idle-based message eviction ---
+        if turn_count > self._max_messages:
+            # If idle state was not provided, compute it from current history
+            if was_idle is None:
+                was_idle = self._is_conversation_idle(conversation_id)
 
-        # Remove turns from the oldest end, preserving tool message chains.
-        # We remove messages from the front until turn_count is within limits.
-        messages_to_remove = 0
-        for msg in history:
-            if self._is_tool_message(msg):
-                # Skip tool messages — they stay attached to their turn
-                continue
-            if turn_count - messages_to_remove > self._max_messages:
-                messages_to_remove += 1
+            if was_idle:
+                # Evict to min_messages (the stable floor)
+                target_turns = self._min_messages
+                if turn_count > target_turns:
+                    turns_to_remove = turn_count - target_turns
+                    cut_index = self._find_cut_index(
+                        self._histories[conversation_id], turns_to_remove
+                    )
+                    if cut_index > 0:
+                        del self._histories[conversation_id][:cut_index]
+                        _LOGGER.debug(
+                            "Trimmed conversation %s by %d messages (%d turns removed) "
+                            "to min_messages=%d (was %d turns, conversation idle for >%ds)",
+                            conversation_id,
+                            cut_index,
+                            turns_to_remove,
+                            self._min_messages,
+                            turn_count,
+                            self._idle_threshold,
+                        )
+                        evicted = True
             else:
-                break
+                _LOGGER.debug(
+                    "Conversation %s has %d turns (max=%d) but is still active, "
+                    "skipping idle eviction to preserve stable prefix",
+                    conversation_id,
+                    turn_count,
+                    self._max_messages,
+                )
 
-        # Now find the actual index to cut at (skipping tool messages that
-        # belong to turns we're keeping)
+        # --- Phase 2: token-based eviction (always applied when limit is set) ---
+        if self._max_tokens is not None:
+            history = self._histories[conversation_id]
+            current_tokens = self.estimate_tokens(history)
+
+            if current_tokens > self._max_tokens:
+                # Token limit exceeded — evict regardless of idle state
+                # First try to trim to max_messages, then below min if still over
+                evicted |= self._evict_to_token_limit(conversation_id)
+
+        return evicted
+
+    def _find_cut_index(
+        self, history: list[dict[str, Any]], turns_to_remove: int
+    ) -> int:
+        """Find the index to cut history at, preserving tool message chains.
+
+        Args:
+            history: Current conversation history
+            turns_to_remove: Number of non-tool turns to remove
+
+        Returns:
+            Index to slice from (messages before this index will be removed)
+        """
         non_tool_removed = 0
         cut_index = 0
         for i, msg in enumerate(history):
             if not self._is_tool_message(msg):
                 non_tool_removed += 1
-                if non_tool_removed > messages_to_remove:
+                if non_tool_removed > turns_to_remove:
                     cut_index = i
                     break
             cut_index = i + 1
+        return cut_index
 
-        if cut_index > 0:
-            del self._histories[conversation_id][:cut_index]
-            _LOGGER.debug(
-                "Trimmed conversation %s by %d messages (%d turns removed) to stay within limit",
-                conversation_id,
-                cut_index,
-                messages_to_remove,
-            )
+    def _evict_to_token_limit(self, conversation_id: str) -> bool:
+        """Evict oldest messages until history fits within max_tokens.
+
+        Two-phase eviction:
+        Phase 1: Remove messages above min_messages (the stable floor).
+        Phase 2: If still over the token limit, remove messages from within
+                 min_messages until the budget is met.
+
+        Modifies the stored history in-place.
+
+        Args:
+            conversation_id: Unique identifier for the conversation
+
+        Returns:
+            True if any messages were evicted, False otherwise
+        """
+        if self._max_tokens is None:
+            return False
+
+        history = self._histories[conversation_id]
+        if not history:
+            return False
+
+        current_tokens = self.estimate_tokens(history)
+        if current_tokens <= self._max_tokens:
+            return False
+
+        original_len = len(history)
+        below_min = False
+
+        # Phase 1: trim messages above min_messages
+        turn_count = self._count_conversation_turns(history)
+        if turn_count > self._min_messages:
+            turns_to_remove = turn_count - self._min_messages
+            cut_index = self._find_cut_index(history, turns_to_remove)
+            if cut_index > 0:
+                history = history[cut_index:]
+                current_tokens = self.estimate_tokens(history)
+
+                if current_tokens <= self._max_tokens:
+                    # Phase 1 was enough
+                    self._histories[conversation_id] = history
+                    _LOGGER.debug(
+                        "Token-evicted conversation %s: removed %d messages "
+                        "(%d -> %d messages) to fit %d token limit "
+                        "(estimated %d tokens, stopped at min_messages=%d)",
+                        conversation_id,
+                        original_len - len(history),
+                        original_len,
+                        len(history),
+                        self._max_tokens,
+                        current_tokens,
+                        self._min_messages,
+                    )
+                    return True
+
+        # Phase 2: still over limit — remove from within min_messages
+        below_min = True
+        messages_to_keep: list[dict[str, Any]] = []
+        kept_tokens = 0
+
+        for message in reversed(history):
+            message_tokens = self.estimate_tokens([message])
+            if kept_tokens + message_tokens <= self._max_tokens:
+                messages_to_keep.insert(0, message)
+                kept_tokens += message_tokens
+            else:
+                # Ensure we keep at least the last message
+                if not messages_to_keep:
+                    messages_to_keep.insert(0, message)
+                break
+
+        messages_removed = original_len - len(messages_to_keep)
+        if messages_removed > 0:
+            self._histories[conversation_id] = messages_to_keep
+            if below_min:
+                _LOGGER.debug(
+                    "Token-evicted conversation %s: removed %d messages "
+                    "(%d -> %d messages) to fit %d token limit "
+                    "(estimated %d tokens, had to go below min_messages=%d)",
+                    conversation_id,
+                    messages_removed,
+                    original_len,
+                    len(messages_to_keep),
+                    self._max_tokens,
+                    kept_tokens,
+                    self._min_messages,
+                )
+            else:
+                _LOGGER.debug(
+                    "Token-evicted conversation %s: removed %d messages "
+                    "(%d -> %d messages) to fit %d token limit "
+                    "(estimated %d tokens)",
+                    conversation_id,
+                    messages_removed,
+                    original_len,
+                    len(messages_to_keep),
+                    self._max_tokens,
+                    kept_tokens,
+                )
+            return True
+
+        return False
 
     def add_message(
         self,
@@ -539,13 +737,16 @@ class ConversationHistoryManager:
             _LOGGER.warning("Attempted to add empty message to conversation %s", conversation_id)
             return
 
+        # Check idle status BEFORE adding new message
+        was_idle_before = self._is_conversation_idle(conversation_id)
+
         msg_with_timestamp = dict(message)
         msg_with_timestamp["timestamp"] = int(time.time())
 
         self._histories[conversation_id].append(msg_with_timestamp)
 
         # Trim to max_messages to prevent unbounded growth (tool messages exempt)
-        self._trim_history(conversation_id)
+        self._trim_history(conversation_id, was_idle=was_idle_before)
 
         _LOGGER.debug(
             "Added %s message to conversation %s (now %d messages, %d turns)",
@@ -559,7 +760,9 @@ class ConversationHistoryManager:
         if self._persist and self._hass:
             asyncio.create_task(self._debounced_save())
 
-    def add_messages(self, conversation_id: str, messages: list[dict[str, Any]]) -> None:
+    def add_messages(
+        self, conversation_id: str, messages: list[dict[str, Any]]
+    ) -> bool:
         """Add multiple messages to conversation history in one call.
 
         Used to save a complete conversation turn including tool calls and results
@@ -569,13 +772,19 @@ class ConversationHistoryManager:
             conversation_id: Unique identifier for the conversation
             messages: List of message dictionaries (OpenAI format)
 
+        Returns:
+            True if history eviction occurred (old messages were removed), False otherwise.
+            Callers can use this to invalidate cached system prompts or entity contexts.
+
         Example:
-            >>> manager.add_messages("conv_123", [
+            >>> evicted = manager.add_messages("conv_123", [
             ...     {"role": "user", "content": "What's the weather?"},
             ...     {"role": "assistant", "content": "", "tool_calls": [...]},
             ...     {"role": "tool", "tool_call_id": "call_x", "content": "Sunny, 25°C"},
             ...     {"role": "assistant", "content": "It's sunny and 25°C"},
             ... ])
+            >>> if evicted:
+            ...     agent.invalidate_system_prompt_cache()
 
         Note:
             If persistence is enabled, a single debounced save is triggered after
@@ -583,10 +792,14 @@ class ConversationHistoryManager:
         """
         if not conversation_id:
             _LOGGER.warning("Attempted to add messages with empty conversation_id")
-            return
+            return False
 
         if not messages:
-            return
+            return False
+
+        # Check idle status BEFORE adding new messages, so timestamps of incoming
+        # messages don't mask the fact that the conversation was idle.
+        was_idle_before = self._is_conversation_idle(conversation_id)
 
         for msg in messages:
             if not isinstance(msg, dict):
@@ -601,20 +814,23 @@ class ConversationHistoryManager:
             msg_with_timestamp["timestamp"] = int(time.time())
             self._histories[conversation_id].append(msg_with_timestamp)
 
-        # Trim once after all messages are added
-        self._trim_history(conversation_id)
+        # Trim once after all messages are added, using idle state captured before
+        evicted = self._trim_history(conversation_id, was_idle=was_idle_before)
 
         _LOGGER.debug(
-            "Added %d messages to conversation %s (now %d messages, %d turns)",
+            "Added %d messages to conversation %s (now %d messages, %d turns, evicted=%s)",
             len(messages),
             conversation_id,
             len(self._histories[conversation_id]),
             self._count_conversation_turns(self._histories[conversation_id]),
+            evicted,
         )
 
         # Trigger debounced save if persistence is enabled
         if self._persist and self._hass:
             asyncio.create_task(self._debounced_save())
+
+        return evicted
 
     def _strip_timestamp(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Return a copy of the message without the internal timestamp field.

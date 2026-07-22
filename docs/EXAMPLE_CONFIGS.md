@@ -43,8 +43,8 @@ Direct Entities: light.*, climate.*, sensor.temperature*, binary_sensor.motion*
 **History Settings:**
 ```yaml
 History Enabled: true
-Max Messages: 10
-Max Tokens: 4000
+Max Messages: 40
+Max Tokens: 16000
 Session Persistence: true
 Session Timeout: 60  # minutes
 ```
@@ -234,7 +234,7 @@ Direct Entities: light.*, climate.*, sensor.*
 
 # History
 History Enabled: true
-Max Messages: 10
+Max Messages: 40
 Session Timeout: 60
 
 # Memory
@@ -513,7 +513,7 @@ Direct Entities: light.*, climate.*, sensor.*
 
 # History
 History Enabled: true
-Max Messages: 10
+Max Messages: 40
 
 # Memory
 Memory Enabled: true
@@ -706,7 +706,7 @@ Context Mode: vector_db  # Efficient context
 Vector DB Top K: 5
 
 # History
-Max Messages: 10
+Max Messages: 40
 History Max Tokens: 3000
 ```
 

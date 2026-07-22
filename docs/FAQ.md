@@ -367,7 +367,7 @@ Entities: light.*, climate.*, sensor.temperature
 
 # History
 History Enabled: true
-Max Messages: 10
+Max Messages: 40
 
 # Optional features
 Memory Enabled: false  # Enable later

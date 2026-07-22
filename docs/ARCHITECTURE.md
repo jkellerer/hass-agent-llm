@@ -393,14 +393,36 @@ custom_components/home_agent/
 
 ### ConversationHistoryManager
 
-**Purpose**: Maintain conversation history across multiple turns
+**Purpose**: Maintain conversation history across multiple turns with intelligent eviction
 
 **Features**:
 - Per-conversation history tracking
-- Message and token limits
+- Two-phase eviction policy (idle-based + token-based)
 - Persistent storage across Home Assistant restarts
 - Debounced saves to reduce I/O
-- Token estimation for context management
+- Token estimation for context management (~4 chars/token)
+
+**Two-Phase Eviction Policy**:
+
+The history manager uses a two-phase eviction strategy to balance context retention with token budget:
+
+1. **Phase 1 - Idle-Based Eviction** (when `max_messages` exceeded):
+   - **Active conversation** (idle < `idle_threshold`): Skip eviction entirely — keep all messages
+   - **Idle conversation** (idle >= `idle_threshold`): Evict oldest messages down to `min_messages`
+   - Preserves tool call chains (4-message groups) atomically — never splits a chain
+
+2. **Phase 2 - Token-Based Eviction** (when `max_tokens` exceeded):
+   - **Greedy backwards eviction** from newest-first
+   - **Phase 2a** (above `min_messages`): Remove turns from newest-first until under limit
+   - **Phase 2b** (below `min_messages`, still over limit): Continue removing turns until under limit or empty
+   - Preserves tool call chains atomically — never splits a chain
+
+This policy ensures:
+
+- **Active conversations** retain full context (no eviction while user is chatting)
+- **Idle conversations** can be trimmed (freeing context for new messages)
+- **Token budget** is always respected (even below `min_messages` if needed)
+- **Tool chains** stay intact (user + tool_call + tool_result + assistant = 4 messages)
 
 **Storage Format**:
 ```json
@@ -416,8 +438,12 @@ custom_components/home_agent/
 ```
 
 **Key Methods**:
-- `add_message()`: Add message to history
-- `get_history()`: Retrieve recent messages with limits
+- `add_message()`: Add message to history, triggers `_trim_history`
+- `add_messages()`: Batch add messages, triggers `_trim_history`
+- `_trim_history()`: Two-phase eviction (idle-based + token-based)
+- `_evict_to_token_limit()`: Greedy backwards token eviction with min_messages boundary
+- `_find_cut_index()`: Find slice index preserving tool chain boundaries
+- `get_history()`: Retrieve recent messages with limits (includes read-time token safety net)
 - `clear_history()`: Clear specific conversation
 - `estimate_tokens()`: Estimate token usage
 

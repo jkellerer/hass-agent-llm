@@ -3,6 +3,10 @@
 import pytest
 
 from custom_components.home_agent.conversation import ConversationHistoryManager
+from custom_components.home_agent.const import (
+    DEFAULT_HISTORY_MAX_MESSAGES,
+    DEFAULT_HISTORY_MIN_MESSAGES,
+)
 
 
 class TestConversationHistoryManager:
@@ -11,7 +15,8 @@ class TestConversationHistoryManager:
     def test_initialization_defaults(self):
         """Test manager initializes with default values."""
         manager = ConversationHistoryManager()
-        assert manager._max_messages == 10
+        assert manager._max_messages == DEFAULT_HISTORY_MAX_MESSAGES
+        assert manager._min_messages == DEFAULT_HISTORY_MIN_MESSAGES
         assert manager._max_tokens is None
         assert len(manager._histories) == 0
 

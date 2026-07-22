@@ -116,8 +116,10 @@ from ..const import (
     CONF_EMIT_EVENTS,
     CONF_EXTERNAL_LLM_ENABLED,
     CONF_HISTORY_ENABLED,
+    CONF_HISTORY_IDLE_THRESHOLD,
     CONF_HISTORY_MAX_MESSAGES,
     CONF_HISTORY_MAX_TOKENS,
+    CONF_HISTORY_MIN_MESSAGES,
     CONF_HISTORY_PERSIST,
     CONF_HISTORY_RECORD_TOOL_CALLS,
     CONF_LLM_MODEL,
@@ -125,15 +127,19 @@ from ..const import (
     CONF_PROMPT_CUSTOM_ADDITIONS,
     CONF_PROMPT_INCLUDE_LABELS,
     CONF_PROMPT_USE_DEFAULT,
+    CONF_SYSTEM_PROMPT_FREEZE,
     CONF_THINKING_ENABLED,
     CONF_TOOLS_CUSTOM,
     CONF_TOOLS_MAX_CALLS_PER_TURN,
     CONF_TOOLS_TIMEOUT,
+    DEFAULT_HISTORY_IDLE_THRESHOLD,
     DEFAULT_HISTORY_MAX_MESSAGES,
     DEFAULT_HISTORY_MAX_TOKENS,
+    DEFAULT_HISTORY_MIN_MESSAGES,
     DEFAULT_MEMORY_EXTRACTION_ENABLED,
     DEFAULT_PROMPT_INCLUDE_LABELS,
     DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_SYSTEM_PROMPT_FREEZE,
     DEFAULT_THINKING_ENABLED,
     DEFAULT_TOOLS_MAX_CALLS_PER_TURN,
     DOMAIN,
@@ -202,7 +208,11 @@ class HomeAgent(
         self.context_manager = ContextManager(hass, config)
         self.conversation_manager = ConversationHistoryManager(
             max_messages=config.get(CONF_HISTORY_MAX_MESSAGES, DEFAULT_HISTORY_MAX_MESSAGES),
+            min_messages=config.get(CONF_HISTORY_MIN_MESSAGES, DEFAULT_HISTORY_MIN_MESSAGES),
             max_tokens=config.get(CONF_HISTORY_MAX_TOKENS, DEFAULT_HISTORY_MAX_TOKENS),
+            idle_threshold=config.get(
+                CONF_HISTORY_IDLE_THRESHOLD, DEFAULT_HISTORY_IDLE_THRESHOLD
+            ),
             hass=hass,
             persist=config.get(CONF_HISTORY_PERSIST, True),
         )
@@ -224,6 +234,14 @@ class HomeAgent(
 
         # Memory manager reference (will be populated from hass.data if available)
         self._memory_manager = None
+
+        # System prompt caching (stable prefix for token caching)
+        self._system_prompt_freeze = config.get(
+            CONF_SYSTEM_PROMPT_FREEZE, DEFAULT_SYSTEM_PROMPT_FREEZE
+        )
+        self._cached_system_prompt: str | None = None
+        self._cached_conversation_id: str | None = None
+        self._system_prompt_dirty = True  # Force initial rebuild
 
         _LOGGER.info("Home Agent initialized with model %s", config.get(CONF_LLM_MODEL))
 
@@ -705,6 +723,84 @@ class HomeAgent(
 
         return prompt
 
+    def _get_system_prompt(
+        self,
+        entity_context: str = "",
+        conversation_id: str | None = None,
+        device_id: str | None = None,
+        user_message: str | None = None,
+        force_rebuild: bool = False,
+    ) -> str:
+        """Get the system prompt, using a cached version for stable prefix token caching.
+
+        When system_prompt_freeze is enabled (default), the entity snapshot is frozen
+        after the first build and reused for subsequent turns. Only the dynamic
+        {{now()}} portion is updated per-turn.
+
+        The cache is invalidated (force rebuild) on:
+        - New conversation begins (conversation_id changes)
+        - History eviction occurred (force_rebuild=True)
+        - Idle detected on next message after idle period (force_rebuild=True)
+        - First message of a session (_system_prompt_dirty flag)
+
+        Args:
+            entity_context: Formatted entity context to inject into template
+            conversation_id: Current conversation ID
+            device_id: Device that triggered the conversation
+            user_message: User's current message
+            force_rebuild: If True, bypass cache and rebuild (e.g. after eviction)
+
+        Returns:
+            Complete system prompt string
+        """
+        # If freeze is disabled, always build fresh (no caching)
+        if not self._system_prompt_freeze:
+            return self._build_system_prompt(
+                entity_context=entity_context,
+                conversation_id=conversation_id,
+                device_id=device_id,
+                user_message=user_message,
+            )
+
+        # Check if we need to rebuild the cache
+        should_rebuild = (
+            force_rebuild
+            or self._system_prompt_dirty
+            or self._cached_conversation_id != conversation_id
+        )
+
+        if should_rebuild:
+            self._cached_system_prompt = self._build_system_prompt(
+                entity_context=entity_context,
+                conversation_id=conversation_id,
+                device_id=device_id,
+                user_message=user_message,
+            )
+            self._cached_conversation_id = conversation_id
+            was_dirty = self._system_prompt_dirty
+            self._system_prompt_dirty = False
+            _LOGGER.debug(
+                "System prompt rebuilt for conversation %s (force=%s, dirty=%s)",
+                conversation_id,
+                force_rebuild,
+                was_dirty,
+            )
+
+        # Return cached prompt (the {{now()}} in the template will be re-rendered
+        # by the LLM mixin on each call, so the timestamp stays fresh)
+        # At this point _cached_system_prompt is guaranteed to be set (not None)
+        assert self._cached_system_prompt is not None
+        return self._cached_system_prompt
+
+    def invalidate_system_prompt_cache(self) -> None:
+        """Invalidate the cached system prompt, forcing a rebuild on next use.
+
+        Call this after history eviction or when entity context has significantly changed.
+        """
+        self._system_prompt_dirty = True
+        self._cached_system_prompt = None
+        _LOGGER.debug("System prompt cache invalidated")
+
     def _render_template(self, template_str: str, variables: dict[str, Any] | None = None) -> str:
         """Render a Jinja2 template string.
 
@@ -1039,12 +1135,19 @@ class HomeAgent(
         context_latency_ms = int((time.time() - context_start) * 1000)
         metrics["performance"]["context_latency_ms"] = context_latency_ms
 
-        # Build system prompt with full context
-        system_prompt = self._build_system_prompt(
+        # Check if this is a new conversation (needs fresh system prompt)
+        is_new_conversation = (
+            self._cached_conversation_id is None
+            or self._cached_conversation_id != conversation_id
+        )
+
+        # Build system prompt with full context (uses cached version if available)
+        system_prompt = self._get_system_prompt(
             entity_context=context,
             conversation_id=conversation_id,
             device_id=device_id,
             user_message=user_message,
+            force_rebuild=is_new_conversation,
         )
 
         # Build messages list
@@ -1292,7 +1395,11 @@ class HomeAgent(
             if not self.config.get(CONF_HISTORY_RECORD_TOOL_CALLS, True):
                 turn_messages = self._filter_tool_messages(turn_messages)
 
-            self.conversation_manager.add_messages(conversation_id, turn_messages)
+            evicted = self.conversation_manager.add_messages(conversation_id, turn_messages)
+
+            # Invalidate system prompt cache if history was evicted
+            if evicted:
+                self.invalidate_system_prompt_cache()
 
             # Extract final response for memory extraction (used below)
             final_response = ""
@@ -1459,12 +1566,19 @@ class HomeAgent(
         if "performance" in metrics:
             metrics["performance"]["context_latency_ms"] = context_latency_ms
 
-        # Build system prompt with full context including device_id
-        system_prompt = self._build_system_prompt(
+        # Check if this is a new conversation (needs fresh system prompt)
+        is_new_conversation = (
+            self._cached_conversation_id is None
+            or self._cached_conversation_id != conversation_id
+        )
+
+        # Build system prompt with full context including device_id (uses cache if available)
+        system_prompt = self._get_system_prompt(
             entity_context=context,
             conversation_id=conversation_id,
             device_id=device_id,
             user_message=user_message,
+            force_rebuild=is_new_conversation,
         )
 
         # Debug: Log context injection
@@ -1601,7 +1715,13 @@ class HomeAgent(
                     if not self.config.get(CONF_HISTORY_RECORD_TOOL_CALLS, True):
                         turn_messages = self._filter_tool_messages(turn_messages)
 
-                    self.conversation_manager.add_messages(conversation_id, turn_messages)
+                    evicted = self.conversation_manager.add_messages(
+                        conversation_id, turn_messages
+                    )
+
+                    # Invalidate system prompt cache if history was evicted
+                    if evicted:
+                        self.invalidate_system_prompt_cache()
 
                 # Extract and store memories if enabled (fire and forget)
                 if self.config.get(

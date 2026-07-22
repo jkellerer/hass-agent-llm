@@ -46,9 +46,12 @@ from .const import (
     CONF_EXTERNAL_LLM_TEMPERATURE,
     CONF_EXTERNAL_LLM_TOOL_DESCRIPTION,
     CONF_HISTORY_ENABLED,
+    CONF_HISTORY_IDLE_THRESHOLD,
     CONF_HISTORY_MAX_MESSAGES,
     CONF_HISTORY_MAX_TOKENS,
+    CONF_HISTORY_MIN_MESSAGES,
     CONF_HISTORY_RECORD_TOOL_CALLS,
+    CONF_SYSTEM_PROMPT_FREEZE,
     CONF_LLM_API_KEY,
     CONF_LLM_BACKEND,
     CONF_LLM_BASE_URL,
@@ -105,8 +108,11 @@ from .const import (
     DEFAULT_EXTERNAL_LLM_TEMPERATURE,
     DEFAULT_EXTERNAL_LLM_TOOL_DESCRIPTION,
     DEFAULT_HISTORY_ENABLED,
+    DEFAULT_HISTORY_IDLE_THRESHOLD,
     DEFAULT_HISTORY_MAX_MESSAGES,
     DEFAULT_HISTORY_MAX_TOKENS,
+    DEFAULT_HISTORY_MIN_MESSAGES,
+    DEFAULT_SYSTEM_PROMPT_FREEZE,
     DEFAULT_HISTORY_RECORD_TOOL_CALLS,
     DEFAULT_LLM_KEEP_ALIVE,
     DEFAULT_LLM_MODEL,
@@ -915,6 +921,33 @@ class HomeAgentOptionsFlow(config_entries.OptionsFlow):
                             current_data.get(CONF_HISTORY_MAX_TOKENS, DEFAULT_HISTORY_MAX_TOKENS),
                         ),
                     ): vol.All(vol.Coerce(int), vol.Range(min=100, max=50000)),
+                    vol.Optional(
+                        CONF_HISTORY_MIN_MESSAGES,
+                        default=current_options.get(
+                            CONF_HISTORY_MIN_MESSAGES,
+                            current_data.get(
+                                CONF_HISTORY_MIN_MESSAGES, DEFAULT_HISTORY_MIN_MESSAGES
+                            ),
+                        ),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=2, max=20)),
+                    vol.Optional(
+                        CONF_HISTORY_IDLE_THRESHOLD,
+                        default=current_options.get(
+                            CONF_HISTORY_IDLE_THRESHOLD,
+                            current_data.get(
+                                CONF_HISTORY_IDLE_THRESHOLD, DEFAULT_HISTORY_IDLE_THRESHOLD
+                            ),
+                        ),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=0, max=3600)),
+                    vol.Required(
+                        CONF_SYSTEM_PROMPT_FREEZE,
+                        default=current_options.get(
+                            CONF_SYSTEM_PROMPT_FREEZE,
+                            current_data.get(
+                                CONF_SYSTEM_PROMPT_FREEZE, DEFAULT_SYSTEM_PROMPT_FREEZE
+                            ),
+                        ),
+                    ): bool,
                     vol.Required(
                         CONF_HISTORY_RECORD_TOOL_CALLS,
                         default=current_options.get(

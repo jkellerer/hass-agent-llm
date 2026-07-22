@@ -26,7 +26,11 @@ Settings → Devices & Services → Home Agent → Configure
 | **Temperature** | `0.7` | Lower (0.3-0.5) for consistent control, higher (0.8-1.0) for creativity |
 | **Max Tokens** | `500` | Reduce to 150-300 for voice, increase for detailed responses |
 | **Context Mode** | `direct` | Use `vector_db` for 100+ entities |
-| **Max Messages** | `10` | Lower to 5 for speed/cost, increase to 20 for complex dialogs |
+| **Max Messages** | `40` | Lower to 5 for speed/cost, increase to 50+ for complex dialogs |
+| **Min Messages** | `10` | Stable floor for history - minimum turns kept after eviction |
+| **Max Tokens** | `16000` | Token-based history limit (0 = unlimited) |
+| **Idle Threshold** | `600` | Seconds of idle before eviction allowed (0 = always) |
+| **System Prompt Freeze** | `true` | Cache system prompt for stable token caching |
 | **Memory Enabled** | `true` | Disable for privacy/simplicity |
 | **Streaming** | `false` | Enable for voice assistants (requires Wyoming TTS) |
 | **External LLM** | `false` | Enable for dual-LLM strategy |
@@ -48,7 +52,11 @@ Context Entities: light.*, climate.*, sensor.temperature
 
 # History Settings
 History Enabled: true
-Max Messages: 10
+Max Messages: 40
+Min Messages: 10  # Keep at least 10 turns (5 complete exchanges) after eviction
+Max Tokens: 16000  # Token-based limit for history
+Idle Threshold: 600  # 10 minutes idle before eviction
+System Prompt Freeze: true  # Enable stable token caching
 History Persist: true
 
 # Tool Settings
@@ -103,8 +111,10 @@ Vector DB Port: 8000
 Vector DB Top K: 5
 
 # History
-Max Messages: 20
-Max Tokens: 6000
+Max Messages: 40
+Min Messages: 10  # Keep more context for complex conversations
+Max Tokens: 16000  # Token-based limit for history
+Idle Threshold: 900  # 15 minutes before eviction
 
 # Memory
 Memory Enabled: true

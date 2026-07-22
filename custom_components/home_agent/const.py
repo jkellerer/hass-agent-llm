@@ -56,8 +56,10 @@ CONF_ADDITIONAL_L2_DISTANCE_THRESHOLD: Final = "additional_l2_distance_threshold
 
 # Configuration keys - Conversation History
 CONF_HISTORY_ENABLED: Final = "history_enabled"
+CONF_HISTORY_MIN_MESSAGES: Final = "history_min_messages"
 CONF_HISTORY_MAX_MESSAGES: Final = "history_max_messages"
 CONF_HISTORY_MAX_TOKENS: Final = "history_max_tokens"
+CONF_HISTORY_IDLE_THRESHOLD: Final = "history_idle_threshold"
 CONF_HISTORY_PERSIST: Final = "history_persist"
 CONF_HISTORY_RECORD_TOOL_CALLS: Final = "history_record_tool_calls"
 CONF_MAX_CONTEXT_TOKENS: Final = "max_context_tokens"
@@ -73,6 +75,7 @@ CONF_PROMPT_USE_DEFAULT: Final = "prompt_use_default"
 CONF_PROMPT_CUSTOM: Final = "prompt_custom"
 CONF_PROMPT_CUSTOM_ADDITIONS: Final = "prompt_custom_additions"
 CONF_PROMPT_INCLUDE_LABELS: Final = "prompt_include_labels"
+CONF_SYSTEM_PROMPT_FREEZE: Final = "system_prompt_freeze"
 
 # Configuration keys - Tool Configuration
 CONF_TOOLS_ENABLE_NATIVE: Final = "tools_enable_native"
@@ -189,8 +192,10 @@ DEFAULT_ADDITIONAL_L2_DISTANCE_THRESHOLD: Final = 250.0
 
 # Default values - Conversation History
 DEFAULT_HISTORY_ENABLED: Final = True
-DEFAULT_HISTORY_MAX_MESSAGES: Final = 10
-DEFAULT_HISTORY_MAX_TOKENS: Final = 4000
+DEFAULT_HISTORY_MIN_MESSAGES: Final = 10  # Stable floor: 5 complete turns (user+assistant pairs)
+DEFAULT_HISTORY_MAX_MESSAGES: Final = 40  # Modern LLMs have large context windows
+DEFAULT_HISTORY_MAX_TOKENS: Final = 16000
+DEFAULT_HISTORY_IDLE_THRESHOLD: Final = 600  # 10 minutes - eviction only when conversation is idle
 DEFAULT_HISTORY_PERSIST: Final = True
 DEFAULT_HISTORY_RECORD_TOOL_CALLS: Final = True
 
@@ -202,6 +207,7 @@ DEFAULT_SUMMARIZATION_ENABLED: Final = False
 # Default values - System Prompt
 DEFAULT_PROMPT_USE_DEFAULT: Final = True
 DEFAULT_PROMPT_INCLUDE_LABELS: Final = False
+DEFAULT_SYSTEM_PROMPT_FREEZE: Final = True  # Freeze entity snapshot for stable prefix caching
 
 # Default values - Tool Configuration
 DEFAULT_TOOLS_ENABLE_NATIVE: Final = True

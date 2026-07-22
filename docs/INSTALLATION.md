@@ -102,8 +102,8 @@ Other providers (LocalAI, LM Studio) follow similar patterns - see reference doc
 1. Navigate to **Configure** > **History Settings**
 2. Configure:
    - **Enable History**: On
-   - **Max Messages**: `10`
-   - **Max Tokens**: `4000`
+   - **Max Messages`: `40`
+   - **Max Tokens`: `16000`
 
 ## Quick Test
 
