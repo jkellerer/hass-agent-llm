@@ -1428,9 +1428,9 @@ class HomeAgent(
         # Save the full turn including tool calls and results in order
         if self.config.get(CONF_HISTORY_ENABLED, True):
             # messages = [system] + old_history + current_turn
-            # Extract the current turn messages
-            old_history = self.conversation_manager.get_history(conversation_id)
-            turn_start = 1 + len(old_history)  # 1 for system prompt
+            # Use the history length captured during message building (not re-fetched)
+            # to avoid mismatch when config max_messages differs from manager default
+            turn_start = 1 + len(history)  # 1 for system prompt
             turn_messages = messages[turn_start:]
 
             # Filter out tool messages if recording is disabled
@@ -1737,10 +1737,9 @@ class HomeAgent(
                     # messages = [system] + history + current_turn
                     # current turn starts after system + history
                     if self.config.get(CONF_HISTORY_ENABLED, True) and len(messages) > 1:
-                        # history was retrieved before the tool loop;
-                        # the current turn is everything after system + old history
-                        old_history = self.conversation_manager.get_history(conversation_id)
-                        turn_start = 1 + len(old_history)  # 1 for system prompt
+                        # Use the history length captured during message building (not re-fetched)
+                        # to avoid mismatch when config max_messages differs from manager default
+                        turn_start = 1 + len(history)  # 1 for system prompt
                     else:
                         turn_start = 1  # Just system prompt, no history
                     turn_messages = messages[turn_start:]

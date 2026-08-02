@@ -365,3 +365,76 @@ async def test_history_disabled(
         # (unless the LLM hallucinates it), but we can't assert that reliably
 
         await agent.close()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_history_no_duplication_with_max_messages(
+    test_hass_with_default_entities, llm_config, session_manager, mock_llm_server
+):
+    """Test that history saving does not duplicate messages when max_messages differs from default.
+
+    This test verifies the fix for a bug where:
+    1. History was fetched WITH max_messages when building the messages list
+    2. History was re-fetched WITHOUT max_messages when calculating turn_start
+    3. The length mismatch caused old history to be re-saved, creating duplicates
+
+    Regression test for turn_start calculation using the captured history length.
+    """
+    conversation_id = "test_no_duplication"
+
+    # Use a max_messages value that differs from the manager default (40)
+    # This triggers the bug if turn_start is calculated from a re-fetched history
+    config = {
+        CONF_LLM_BASE_URL: llm_config["base_url"],
+        CONF_LLM_API_KEY: llm_config.get("api_key", ""),
+        CONF_LLM_MODEL: llm_config["model"],
+        CONF_LLM_TEMPERATURE: 0.7,
+        CONF_LLM_MAX_TOKENS: 500,
+        CONF_HISTORY_ENABLED: True,
+        CONF_HISTORY_PERSIST: False,
+        CONF_HISTORY_MAX_MESSAGES: 10,  # Different from default 40
+        CONF_EMIT_EVENTS: False,
+        CONF_DEBUG_LOGGING: False,
+    }
+
+    with mock_llm_server.patch_aiohttp():
+        agent = HomeAgent(test_hass_with_default_entities, config, session_manager)
+
+        # Send multiple distinct messages
+        test_messages = [
+            "Hello, this is message one.",
+            "Now sending message two.",
+            "This is message three.",
+        ]
+
+        for msg in test_messages:
+            response = await agent.process_message(
+                text=msg,
+                conversation_id=conversation_id,
+            )
+            assert response is not None, f"Response should not be None for: {msg}"
+            assert isinstance(response, str), f"Response should be a string, got {type(response)}"
+
+        # Get final history and check for duplicates
+        history = agent.conversation_manager.get_history(conversation_id)
+
+        # Extract user messages in order
+        user_messages = [msg for msg in history if msg.get("role") == "user"]
+        user_contents = [msg.get("content", "") for msg in user_messages]
+
+        # Each test message should appear exactly once
+        for test_msg in test_messages:
+            count = sum(1 for content in user_contents if test_msg in content)
+            assert (
+                count == 1
+            ), f"Message '{test_msg}' appears {count} times (expected 1) — duplication bug!"
+
+        # Verify no user message content is duplicated
+        seen = set()
+        for content in user_contents:
+            assert content not in seen, f"Duplicate user message found: {content[:80]}..."
+            seen.add(content)
+
+        await agent.close()
