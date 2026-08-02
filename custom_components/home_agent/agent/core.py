@@ -132,6 +132,8 @@ from ..const import (
     CONF_TOOLS_CUSTOM,
     CONF_TOOLS_MAX_CALLS_PER_TURN,
     CONF_TOOLS_TIMEOUT,
+    CONF_IMAGE_MAX_COUNT,
+    CONF_IMAGES_ENABLED,
     DEFAULT_HISTORY_IDLE_THRESHOLD,
     DEFAULT_HISTORY_MAX_MESSAGES,
     DEFAULT_HISTORY_MAX_TOKENS,
@@ -142,6 +144,8 @@ from ..const import (
     DEFAULT_SYSTEM_PROMPT_FREEZE,
     DEFAULT_THINKING_ENABLED,
     DEFAULT_TOOLS_MAX_CALLS_PER_TURN,
+    DEFAULT_IMAGE_MAX_COUNT,
+    DEFAULT_IMAGES_ENABLED,
     DOMAIN,
     EVENT_CONVERSATION_FINISHED,
     EVENT_CONVERSATION_STARTED,
@@ -1304,12 +1308,50 @@ class HomeAgent(
                             return obj.isoformat()
                         raise TypeError ("Object of type %s is not JSON serializable" % type(obj))
 
+                    tool_result = content_item.tool_result
+
+                    # Check if result contains images for multimodal delivery
+                    if tool_result and isinstance(tool_result, dict):
+                        images = tool_result.get("images")
+                        if images and isinstance(images, list) and self.config.get(CONF_IMAGES_ENABLED, DEFAULT_IMAGES_ENABLED):
+                            # Build multimodal content array
+                            content_parts = [
+                                {
+                                    "type": "text",
+                                    "text": json.dumps({k: v for k, v in tool_result.items() if k != "images"}, default=json_encoder),
+                                }
+                            ]
+
+                            # Add image URLs
+                            max_images = self.config.get(CONF_IMAGE_MAX_COUNT, DEFAULT_IMAGE_MAX_COUNT)
+                            for img in images[:max_images]:
+                                if isinstance(img, dict) and "url" in img:
+                                    content_parts.append({
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": img["url"],
+                                            "detail": "auto",
+                                        }
+                                    }) # type: ignore
+                                    _LOGGER.debug(
+                                        "Added image URL for entity %s to tool result",
+                                        img.get("entity_id"),
+                                    )
+
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": content_item.tool_call_id,
+                                "content": content_parts,
+                            })
+                            continue
+
+                    # Fallback to text-only format
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": content_item.tool_call_id,
                             "name": content_item.tool_name,
-                            "content": json.dumps(content_item.tool_result, default=json_encoder),
+                            "content": json.dumps(tool_result, default=json_encoder),
                         }
                     )
 

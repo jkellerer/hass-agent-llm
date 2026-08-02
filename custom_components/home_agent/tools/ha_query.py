@@ -7,11 +7,12 @@ attributes, and historical data from Home Assistant.
 from __future__ import annotations
 
 import asyncio
+import base64
 import fnmatch
 import logging
 import re
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from homeassistant.core import HomeAssistant, State
 from homeassistant.util import dt as dt_util
@@ -34,6 +35,21 @@ from ..const import (
     HISTORY_AGGREGATE_SUM,
     TOOL_HA_QUERY,
 )
+
+# Domains that support image/video snapshots
+IMAGE_CAPABLE_DOMAINS = {"camera", "media_player", "image"}
+
+# Magic bytes for common image formats
+IMAGE_MAGIC_BYTES: Final = {
+    b"\xff\xd8\xff": "image/jpeg",
+    b"\x89\x50\x4e\x47": "image/png",
+    b"GIF87a": "image/gif",
+    b"GIF89a": "image/gif",
+    b"RIFF": [re.compile(b'^.{8}WEBP'), "image/webp"],  # WebP starts with RIFF + WEBP at offset 8
+}
+# Maximum image size for inline encoding (5MB)
+MAX_INLINE_IMAGE_SIZE = 5 * 1024 * 1024
+
 from ..exceptions import PermissionDenied, ToolExecutionError, ValidationError
 from .registry import BaseTool
 
@@ -113,7 +129,11 @@ class HomeAssistantQueryTool(BaseTool):
             "Use this to check if lights are on, get sensor values, check door "
             "lock status, or retrieve any entity state information. "
             "Supports wildcards (e.g., 'light.*' for all lights) and historical "
-            "data queries. Always use this before ha_control to check current state."
+            "data queries. For camera or image entities, set include_image=true to "
+            "get a snapshot image (requires a vision-capable model). "
+            "Use image_format='inline' to embed the image as base64 data URI "
+            "(useful for LLMs that cannot access URLs behind auth/firewalls). "
+            "Always use this before ha_control to check current state."
         )
 
     @property
@@ -176,6 +196,27 @@ class HomeAssistantQueryTool(BaseTool):
                     },
                     "required": ["duration"],
                 },
+                "include_image": {
+                    "type": "boolean",
+                    "description": (
+                        "For camera entities, set to true to include a snapshot image URL "
+                        "in the result. Requires a vision-capable LLM model to be useful. "
+                        "Default is false to avoid unexpected token costs."
+                    ),
+                    "default": False,
+                },
+                "image_format": {
+                    "type": "string",
+                    "enum": ["url", "inline"],
+                    "description": (
+                        "How to include the image: 'url' returns a URL to the image "
+                        "(default, lower token cost), 'inline' fetches and embeds the "
+                        "image as a base64 data URI (use for LLMs that cannot access "
+                        "URLs behind auth/firewalls, e.g. local models like Ollama). "
+                        "Ignored if include_image is false."
+                    ),
+                    "default": "url",
+                },
             },
             "required": ["entity_id"],
         }
@@ -187,12 +228,15 @@ class HomeAssistantQueryTool(BaseTool):
             entity_id: Entity ID to query (supports wildcards)
             attributes: Optional list of specific attributes to return
             history: Optional dict with duration and aggregation for historical data
+            include_image: Whether to include image URLs for camera entities
+            image_format: How to include image ('url' or 'inline' base64 data URI)
 
         Returns:
             Dict containing:
                 - success: bool indicating if execution succeeded
                 - entity_id: The queried entity ID (or pattern)
                 - entities: List of entity data dicts
+                - images: List of image info dicts (if include_image=true)
                 - count: Number of entities returned
                 - message: Human-readable result message
 
@@ -204,6 +248,8 @@ class HomeAssistantQueryTool(BaseTool):
         entity_id_pattern = kwargs.get("entity_id")
         attributes_filter = kwargs.get("attributes")
         history_params = kwargs.get("history")
+        include_image = kwargs.get("include_image", False)
+        image_format = kwargs.get("image_format", "url")
 
         # Validate required parameters
         if not entity_id_pattern:
@@ -239,6 +285,7 @@ class HomeAssistantQueryTool(BaseTool):
 
             # Query current states
             entity_data = []
+            images = []
             for entity_id in matching_entities:
                 state = self.hass.states.get(entity_id)
                 if state:
@@ -248,6 +295,24 @@ class HomeAssistantQueryTool(BaseTool):
                     )
                     entity_data.append(entity_info)
 
+                    # Collect images if requested and entity is image-capable
+                    if include_image and self._is_image_entity(entity_id):
+                        image_url = await self._get_image_url(entity_id)
+                        if image_url:
+                            if image_format == "inline":
+                                # Fetch and embed image as base64 data URI
+                                data_uri = await self._fetch_and_encode_image(image_url)
+                                if data_uri:
+                                    images.append({
+                                        "url": data_uri,
+                                        "entity_id": entity_id,
+                                    })
+                            else:
+                                images.append({
+                                    "url": image_url,
+                                    "entity_id": entity_id,
+                                })
+
             result = {
                 "success": True,
                 "entity_id": entity_id_pattern,
@@ -255,6 +320,15 @@ class HomeAssistantQueryTool(BaseTool):
                 "count": len(entity_data),
                 "message": self._build_success_message(entity_id_pattern, len(entity_data)),
             }
+
+            # Add images array if any were collected
+            if images:
+                result["images"] = images
+                _LOGGER.info(
+                    "Added %d image(s) to result for pattern: %s",
+                    len(images),
+                    entity_id_pattern,
+                )
 
             _LOGGER.info(
                 "Successfully queried %d entities matching pattern: %s",
@@ -371,6 +445,170 @@ class HomeAssistantQueryTool(BaseTool):
         from ..context_providers.base import get_entity_available_services
 
         return get_entity_available_services(self.hass, entity_id)
+
+    def _is_image_entity(self, entity_id: str) -> bool:
+        """Check if an entity is capable of providing images.
+
+        Args:
+            entity_id: The entity ID to check
+
+        Returns:
+            True if the entity supports image snapshots
+        """
+        domain = entity_id.split(".")[0]
+        return domain in IMAGE_CAPABLE_DOMAINS
+
+    async def _get_image_url(self, entity_id: str) -> str | None:
+        """Get the image URL for an image-capable entity.
+
+        Uses entity_picture attribute if available (camera, image, media_player
+        all support this - it includes auth tokens for external access).
+        Falls back to camera_proxy URL construction for cameras without
+        entity_picture.
+
+        Args:
+            entity_id: The entity ID
+
+        Returns:
+            The image URL or None if unavailable
+        """
+        try:
+            state = self.hass.states.get(entity_id)
+            if not state or state.state == "unavailable":
+                _LOGGER.debug("Entity %s is unavailable", entity_id)
+                return None
+
+            # Get base URL for prepending to relative paths
+            base_url = self.hass.config.external_url or self.hass.config.internal_url
+            if not base_url:
+                _LOGGER.warning(
+                    "Cannot generate image URL for %s: "
+                    "internal_url/external_url not configured",
+                    entity_id,
+                )
+                return None
+
+            # Try entity_picture first - works for camera.*, image.*, media_player.*
+            # entity_picture includes auth tokens, so it works for external access
+            entity_picture = state.attributes.get("entity_picture")
+            if entity_picture:
+                if str(entity_picture).startswith("/"):
+                    image_url = f"{base_url}{entity_picture}"
+                else:
+                    image_url = str(entity_picture)
+
+                _LOGGER.debug("Using entity_picture for %s: %s", entity_id, image_url)
+                return image_url
+
+            # Fallback: construct camera_proxy URL (for cameras without entity_picture)
+            timestamp = dt_util.utcnow().strftime("%Y%m%d%H%M%S")
+            proxy_url = f"{base_url}/api/camera_proxy/{entity_id}?{timestamp}"
+
+            _LOGGER.debug("Using camera_proxy fallback for %s: %s", entity_id, proxy_url)
+            return proxy_url
+
+        except Exception as error:
+            _LOGGER.warning(
+                "Failed to generate image URL for %s: %s",
+                entity_id,
+                error,
+            )
+            return None
+
+    @staticmethod
+    def _detect_image_mime_type(image_bytes: bytes) -> str:
+        """Detect image MIME type from magic bytes.
+
+        Args:
+            image_bytes: Raw image data
+
+        Returns:
+            MIME type string (e.g. "image/png", "image/jpeg", "image/unknown")
+        """
+        for magic, mime_type in IMAGE_MAGIC_BYTES.items():
+            if isinstance(mime_type, list) and isinstance(mime_type[0], re.Pattern):
+                if mime_type[0].match(image_bytes):
+                    return str(mime_type[1])
+            elif image_bytes.startswith(magic) and isinstance(mime_type, str):
+                return mime_type
+        return "image/unknown"
+
+    async def _fetch_and_encode_image(self, image_url: str) -> str | None:
+        """Fetch image from URL and encode as base64 data URI.
+
+        Uses Home Assistant's aiohttp client session for authenticated requests.
+        Reads in chunks with size limit to avoid OOM on large streams.
+
+        Args:
+            image_url: URL to fetch the image from
+
+        Returns:
+            Base64 data URI (e.g. "data:image/png;base64,...") or None on failure
+        """
+        try:
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+            session = async_get_clientsession(self.hass)
+
+            _LOGGER.debug("Fetching image from %s", image_url)
+            async with session.get(image_url) as resp:
+                if resp.status != 200:
+                    _LOGGER.warning(
+                        "Failed to fetch image from %s: HTTP %d",
+                        image_url,
+                        resp.status,
+                    )
+                    return None
+
+                # Read in chunks with size limit to avoid OOM
+                chunks = []
+                total_size = 0
+                chunk_size = 8192  # 8KB chunks
+
+                async for chunk in resp.content.iter_chunked(chunk_size):
+                    total_size += len(chunk)
+                    if total_size > MAX_INLINE_IMAGE_SIZE:
+                        _LOGGER.warning(
+                            "Image from %s exceeds size limit (%d bytes > %d bytes), "
+                            "aborting download",
+                            image_url,
+                            total_size,
+                            MAX_INLINE_IMAGE_SIZE,
+                        )
+                        return None
+                    chunks.append(chunk)
+
+                image_bytes = b"".join(chunks)
+
+                # Detect MIME type from magic bytes
+                mime_type = self._detect_image_mime_type(image_bytes)
+
+                # Encode as base64
+                encoded = base64.b64encode(image_bytes).decode("ascii")
+                data_uri = f"data:{mime_type};base64,{encoded}"
+
+                _LOGGER.info(
+                    "Encoded image from %s as %s data URI (%d bytes, %d chars encoded)",
+                    image_url,
+                    mime_type,
+                    len(image_bytes),
+                    len(encoded),
+                )
+                return data_uri
+
+        except ImportError:
+            _LOGGER.warning(
+                "aiohttp_client not available, cannot fetch inline image from %s",
+                image_url,
+            )
+            return None
+        except Exception as error:
+            _LOGGER.warning(
+                "Failed to fetch and encode image from %s: %s",
+                image_url,
+                error,
+            )
+            return None
 
     def _format_entity_state(
         self,

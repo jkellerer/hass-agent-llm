@@ -119,6 +119,10 @@ CONF_EMIT_EVENTS: Final = "emit_events"
 # Configuration keys - Streaming
 CONF_STREAMING_ENABLED: Final = "streaming_enabled"
 
+# Configuration keys - Camera Images
+CONF_IMAGES_ENABLED: Final = "images_enabled"
+CONF_IMAGE_MAX_COUNT: Final = "image_max_count"
+
 # Configuration keys - Conversation Session
 CONF_SESSION_TIMEOUT: Final = "session_timeout"
 CONF_SESSION_PERSISTENCE_ENABLED: Final = "session_persistence_enabled"
@@ -250,6 +254,10 @@ DEFAULT_EMIT_EVENTS: Final = True
 
 # Default values - Streaming
 DEFAULT_STREAMING_ENABLED: Final = False
+
+# Default values - Camera Images
+DEFAULT_IMAGES_ENABLED: Final = True
+DEFAULT_IMAGE_MAX_COUNT: Final = 3
 
 # Default values - Conversation Session
 DEFAULT_SESSION_TIMEOUT: Final = 3600  # 1 hour in seconds
@@ -761,6 +769,7 @@ Use this tool to get information about the current state of the home. Examples:
 - Get current temperature from sensors
 - See door lock status
 - Get historical data for trend analysis
+- View camera feeds (set include_image=true for camera entities)
 
 CRITICAL RULES:
 1. ALWAYS check the Available Devices CSV FIRST before any tool calls
