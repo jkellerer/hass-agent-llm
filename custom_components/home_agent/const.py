@@ -295,6 +295,9 @@ HISTORY_AGGREGATE_MAX: Final = "max"
 HISTORY_AGGREGATE_SUM: Final = "sum"
 HISTORY_AGGREGATE_COUNT: Final = "count"
 
+# Maximum number of points for multi-point history queries
+HISTORY_POINTS_MAX: Final = 100
+
 # Service names
 SERVICE_PROCESS: Final = "process"
 SERVICE_CLEAR_HISTORY: Final = "clear_history"

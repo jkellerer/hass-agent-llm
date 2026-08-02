@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 from homeassistant.core import State
+from homeassistant.util import dt as dt_util
 
 from custom_components.home_agent.const import (
     HISTORY_AGGREGATE_AVG,
@@ -766,3 +767,243 @@ class TestHomeAssistantQueryTool:
         assert "color_temp" in entity["attributes"]
         assert "rgb_color" in entity["attributes"]
         assert "friendly_name" in entity["attributes"]
+
+    # -- Points parameter tests --
+
+    def test_points_in_schema(self, mock_hass):
+        """Test that points parameter is in the JSON schema."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        params = tool.parameters
+        history_props = params["properties"]["history"]["properties"]
+        assert "points" in history_props
+        assert history_props["points"]["type"] == "integer"
+        assert history_props["points"]["minimum"] == 1
+        assert history_props["points"]["default"] == 1
+
+    async def test_query_history_points_default_single_value(
+        self, mock_hass, mock_history_states, mock_recorder_instance
+    ):
+        """Test that points defaults to 1 (single value, backward compatible)."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        mock_hass.states.async_entity_ids.return_value = ["sensor.temperature"]
+
+        with (
+            patch(
+                "homeassistant.components.recorder.util.async_migration_in_progress"
+            ) as mock_migration,
+            patch("homeassistant.components.recorder.get_instance") as mock_get_instance,
+            patch(
+                "homeassistant.components.recorder.history.state_changes_during_period"
+            ) as mock_history,
+        ):
+            mock_migration.return_value = False
+            mock_get_instance.return_value = mock_recorder_instance
+            mock_history.return_value = {"sensor.temperature": mock_history_states}
+
+            result = await tool.execute(
+                entity_id="sensor.temperature", history={"duration": "1h"}
+            )
+
+            assert result["success"] is True
+            assert result["points"] == 1
+            entity_result = result["history"][0]
+            assert "value" in entity_result
+            assert "values" not in entity_result
+
+    async def test_query_history_points_returns_list(
+        self, mock_hass, mock_history_states, mock_recorder_instance
+    ):
+        """Test that points > 1 returns a list of time/value pairs."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        mock_hass.states.async_entity_ids.return_value = ["sensor.temperature"]
+
+        with (
+            patch(
+                "homeassistant.components.recorder.util.async_migration_in_progress"
+            ) as mock_migration,
+            patch("homeassistant.components.recorder.get_instance") as mock_get_instance,
+            patch(
+                "homeassistant.components.recorder.history.state_changes_during_period"
+            ) as mock_history,
+        ):
+            mock_migration.return_value = False
+            mock_get_instance.return_value = mock_recorder_instance
+            mock_history.return_value = {"sensor.temperature": mock_history_states}
+
+            result = await tool.execute(
+                entity_id="sensor.temperature",
+                history={"duration": "1h", "points": 5},
+            )
+
+            assert result["success"] is True
+            assert result["points"] == 5
+            entity_result = result["history"][0]
+            assert "values" in entity_result
+            assert "value" not in entity_result
+            assert len(entity_result["values"]) == 5
+            assert entity_result["num_points"] == 5
+            # Each point has time and value
+            for point in entity_result["values"]:
+                assert "time" in point
+                assert "value" in point
+
+    async def test_query_history_points_validation_zero(self, mock_hass):
+        """Test that points=0 raises ValidationError."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        mock_hass.states.async_entity_ids.return_value = ["sensor.temperature"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await tool.execute(
+                entity_id="sensor.temperature",
+                history={"duration": "1h", "points": 0},
+            )
+
+        assert "points" in str(exc_info.value).lower()
+
+    async def test_query_history_points_validation_negative(self, mock_hass):
+        """Test that negative points raises ValidationError."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        mock_hass.states.async_entity_ids.return_value = ["sensor.temperature"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await tool.execute(
+                entity_id="sensor.temperature",
+                history={"duration": "1h", "points": -1},
+            )
+
+        assert "points" in str(exc_info.value).lower()
+
+    async def test_query_history_points_validation_too_high(self, mock_hass):
+        """Test that points > 100 raises ValidationError."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        mock_hass.states.async_entity_ids.return_value = ["sensor.temperature"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await tool.execute(
+                entity_id="sensor.temperature",
+                history={"duration": "1h", "points": 101},
+            )
+
+        assert "100" in str(exc_info.value)
+
+    async def test_query_history_points_float_raises(self, mock_hass):
+        """Test that non-integer points raises ValidationError."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        mock_hass.states.async_entity_ids.return_value = ["sensor.temperature"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await tool.execute(
+                entity_id="sensor.temperature",
+                history={"duration": "1h", "points": 2.5},
+            )
+
+        assert "points" in str(exc_info.value).lower()
+
+    def test_aggregate_to_points_empty_states(self, mock_hass):
+        """Test _aggregate_to_points with empty states."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        now = dt_util.now()
+        result = tool._aggregate_to_points(
+            [], HISTORY_AGGREGATE_AVG, 5, now - timedelta(hours=1), now
+        )
+        assert result == []
+
+    def test_aggregate_to_points_basic(self, mock_hass, mock_history_states):
+        """Test _aggregate_to_points generates correct number of points."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        now = dt_util.now()
+        result = tool._aggregate_to_points(
+            mock_history_states,
+            HISTORY_AGGREGATE_AVG,
+            3,
+            now - timedelta(hours=1),
+            now,
+        )
+        assert len(result) == 3
+        for point in result:
+            assert "time" in point
+            assert "value" in point
+
+    def test_forward_fill_basic(self, mock_hass):
+        """Test forward fill for count aggregation."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        values = [1, None, None, 5, None, 7]
+        result = tool._forward_fill(values)
+        assert result == [1, 1, 1, 5, 5, 7]
+
+    def test_forward_fill_leading_nones(self, mock_hass):
+        """Test forward fill with leading Nones remain None."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        values = [None, None, 3, None, 5]
+        result = tool._forward_fill(values)
+        assert result == [None, None, 3, 3, 5]
+
+    def test_linear_interpolate_basic(self, mock_hass):
+        """Test linear interpolation for avg/min/max/sum."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        values = [10.0, None, None, 40.0]
+        result = tool._linear_interpolate(values)
+        assert result[0] == 10.0
+        assert abs(result[1] - 20.0) < 0.01
+        assert abs(result[2] - 30.0) < 0.01
+        assert result[3] == 40.0
+
+    def test_linear_interpolate_leading_trailing_nones(self, mock_hass):
+        """Test that leading/trailing Nones remain None (no extrapolation)."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        values = [None, 10.0, None, 40.0, None]
+        result = tool._linear_interpolate(values)
+        assert result[0] is None
+        assert result[1] == 10.0
+        assert abs(result[2] - 25.0) < 0.01
+        assert result[3] == 40.0
+        assert result[4] is None
+
+    def test_fill_gaps_count_uses_forward_fill(self, mock_hass):
+        """Test that count aggregation uses forward fill."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        values = [1, None, 5, None, 7]
+        result = tool._fill_gaps(values, HISTORY_AGGREGATE_COUNT)
+        assert result == [1, 1, 5, 5, 7]
+
+    def test_fill_gaps_avg_uses_interpolation(self, mock_hass):
+        """Test that avg aggregation uses linear interpolation."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        values = [10.0, None, 30.0]
+        result = tool._fill_gaps(values, HISTORY_AGGREGATE_AVG)
+        assert result[0] == 10.0
+        assert abs(result[1] - 20.0) < 0.01
+        assert result[2] == 30.0
+
+    async def test_query_history_points_with_count_aggregation(
+        self, mock_hass, mock_history_states, mock_recorder_instance
+    ):
+        """Test points with count aggregation (forward-fill strategy)."""
+        tool = HomeAssistantQueryTool(mock_hass)
+        mock_hass.states.async_entity_ids.return_value = ["sensor.temperature"]
+
+        with (
+            patch(
+                "homeassistant.components.recorder.util.async_migration_in_progress"
+            ) as mock_migration,
+            patch("homeassistant.components.recorder.get_instance") as mock_get_instance,
+            patch(
+                "homeassistant.components.recorder.history.state_changes_during_period"
+            ) as mock_history,
+        ):
+            mock_migration.return_value = False
+            mock_get_instance.return_value = mock_recorder_instance
+            mock_history.return_value = {"sensor.temperature": mock_history_states}
+
+            result = await tool.execute(
+                entity_id="sensor.temperature",
+                history={"duration": "1h", "aggregate": HISTORY_AGGREGATE_COUNT, "points": 3},
+            )
+
+            assert result["success"] is True
+            entity_result = result["history"][0]
+            assert len(entity_result["values"]) == 3
+            # Count values should be integers (forward-filled)
+            for point in entity_result["values"]:
+                if point["value"] is not None:
+                    assert isinstance(point["value"], int)

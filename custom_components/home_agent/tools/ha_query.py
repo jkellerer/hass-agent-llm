@@ -33,6 +33,7 @@ from ..const import (
     HISTORY_AGGREGATE_MAX,
     HISTORY_AGGREGATE_MIN,
     HISTORY_AGGREGATE_SUM,
+    HISTORY_POINTS_MAX,
     TOOL_HA_QUERY,
 )
 
@@ -192,6 +193,19 @@ class HomeAssistantQueryTool(BaseTool):
                                 HISTORY_AGGREGATE_SUM,
                                 HISTORY_AGGREGATE_COUNT,
                             ],
+                        },
+                        "points": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": HISTORY_POINTS_MAX,
+                            "default": 1,
+                            "description": (
+                                "Number of evenly-distributed aggregate points to return "
+                                "over the selected duration. Default is 1 (single aggregated "
+                                "value). When >1, returns a list of {time, value} pairs. "
+                                "Gaps are filled: 'count' uses forward-fill, others use "
+                                "linear interpolation. Maximum: 100."
+                            ),
                         },
                     },
                     "required": ["duration"],
@@ -696,6 +710,18 @@ class HomeAssistantQueryTool(BaseTool):
         # Get aggregation type
         aggregate = history_params.get("aggregate", HISTORY_AGGREGATE_AVG)
 
+        # Get points parameter
+        points = history_params.get("points", 1)
+        if not isinstance(points, int) or points < 1:
+            raise ValidationError(
+                f"Invalid points value: '{points}'. "
+                f"Expected integer >= 1."
+            )
+        if points > HISTORY_POINTS_MAX:
+            raise ValidationError(
+                f"Points value {points} exceeds maximum of {HISTORY_POINTS_MAX}."
+            )
+
         # Calculate time range
         end_time = dt_util.now()
         start_time = end_time - duration
@@ -713,22 +739,43 @@ class HomeAssistantQueryTool(BaseTool):
                 )
 
                 if entity_history:
-                    # Apply aggregation
-                    aggregated_value = self._aggregate_history(
-                        entity_history,
-                        aggregate,
-                    )
+                    if points > 1:
+                        # Multi-point: generate evenly-distributed aggregated values
+                        values = self._aggregate_to_points(
+                            entity_history,
+                            aggregate,
+                            points,
+                            start_time,
+                            end_time,
+                        )
+                        entity_history_data.append(
+                            {
+                                "entity_id": entity_id,
+                                "aggregate": aggregate,
+                                "values": values,
+                                "num_points": points,
+                                "data_points": len(entity_history),
+                                "start_time": start_time.isoformat(timespec="seconds"),
+                                "end_time": end_time.isoformat(timespec="seconds"),
+                            }
+                        )
+                    else:
+                        # Single-point: existing behavior
+                        aggregated_value = self._aggregate_history(
+                            entity_history,
+                            aggregate,
+                        )
 
-                    entity_history_data.append(
-                        {
-                            "entity_id": entity_id,
-                            "aggregate": aggregate,
-                            "value": aggregated_value,
-                            "data_points": len(entity_history),
-                            "start_time": start_time.isoformat(timespec="seconds"),
-                            "end_time": end_time.isoformat(timespec="seconds"),
-                        }
-                    )
+                        entity_history_data.append(
+                            {
+                                "entity_id": entity_id,
+                                "aggregate": aggregate,
+                                "value": aggregated_value,
+                                "data_points": len(entity_history),
+                                "start_time": start_time.isoformat(timespec="seconds"),
+                                "end_time": end_time.isoformat(timespec="seconds"),
+                            }
+                        )
 
             except ToolExecutionError:
                 # Re-raise tool execution errors (e.g., recorder not available)
@@ -748,8 +795,10 @@ class HomeAssistantQueryTool(BaseTool):
             "count": len(entity_history_data),
             "duration": duration_str,
             "aggregate": aggregate,
+            "points": points,
             "message": f"Retrieved {aggregate} values for {len(entity_history_data)} "
-            f"entities over {duration_str}",
+            f"entities over {duration_str}"
+            f" ({points} point{'s' if points > 1 else ''})",
         }
 
     async def _get_entity_history(
@@ -859,6 +908,149 @@ class HomeAssistantQueryTool(BaseTool):
         else:
             _LOGGER.warning("Unknown aggregate type: %s", aggregate)
             return None
+
+    def _aggregate_to_points(
+        self,
+        states: Sequence[State],
+        aggregate: str,
+        num_points: int,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        """Aggregate historical state data into evenly-distributed time points.
+
+        For each point, computes the aggregate value for the states that fall
+        within the corresponding time bucket. Gaps (buckets with no states) are
+        filled: 'count' uses forward-fill (monotonically increasing), all other
+        aggregates use linear interpolation.
+
+        Args:
+            states: List of state objects (ordered by time)
+            aggregate: Aggregation type (avg, min, max, sum, count)
+            num_points: Number of evenly-distributed points to generate
+            start_time: Start of the time range
+            end_time: End of the time range
+
+        Returns:
+            List of dicts with 'time' (ISO string) and 'value' (aggregated value)
+        """
+        if not states or num_points < 1:
+            return []
+
+        # Calculate bucket boundaries
+        total_seconds = (end_time - start_time).total_seconds()
+        bucket_seconds = total_seconds / num_points
+
+        # Group states into buckets based on their last_updated time
+        buckets: list[list[State]] = [[] for _ in range(num_points)]
+        for state in states:
+            # Determine which bucket this state belongs to
+            state_seconds = (state.last_updated - start_time).total_seconds()
+            bucket_idx = int(state_seconds / bucket_seconds)
+            # Clamp to valid range
+            bucket_idx = max(0, min(bucket_idx, num_points - 1))
+            buckets[bucket_idx].append(state)
+
+        # Calculate aggregate value for each bucket
+        raw_values: list[float | int | None] = []
+        for bucket in buckets:
+            if bucket:
+                raw_values.append(self._aggregate_history(bucket, aggregate))
+            else:
+                raw_values.append(None)
+
+        # Fill gaps
+        filled_values = self._fill_gaps(raw_values, aggregate)
+
+        # Build result with timestamps at bucket centers
+        result = []
+        for i in range(num_points):
+            point_time = start_time + timedelta(seconds=bucket_seconds * (i + 0.5))
+            result.append({
+                "time": point_time.isoformat(timespec="seconds"),
+                "value": filled_values[i],
+            })
+
+        return result
+
+    def _fill_gaps(
+        self,
+        values: list[float | int | None],
+        aggregate: str,
+    ) -> list[float | int | None]:
+        """Fill gaps in aggregated values.
+
+        For 'count' aggregation (monotonically increasing), uses forward-fill.
+        For all other aggregates, uses linear interpolation.
+
+        Args:
+            values: List of values (may contain None for gaps)
+            aggregate: Aggregation type
+
+        Returns:
+            List with gaps filled
+        """
+        if not values:
+            return values
+
+        if aggregate == HISTORY_AGGREGATE_COUNT:
+            return self._forward_fill(values)
+        else:
+            return self._linear_interpolate(values)
+
+    @staticmethod
+    def _forward_fill(values: list[float | int | None]) -> list[float | int | None]:
+        """Forward-fill None values with the last known value.
+
+        Leading Nones remain None (no data before first observation).
+        """
+        result = list(values)
+        last_value: float | int | None = None
+        for i in range(len(result)):
+            if result[i] is not None:
+                last_value = result[i]
+            else:
+                result[i] = last_value
+        return result
+
+    @staticmethod
+    def _linear_interpolate(values: list[float | int | None]) -> list[float | int | None]:
+        """Linearly interpolate None values between known values.
+
+        Leading/trailing Nones remain None (extrapolation not performed).
+        """
+        result = list(values)
+        n = len(result)
+
+        for i in range(n):
+            if result[i] is not None:
+                continue
+
+            # Find previous known value
+            prev_idx = None
+            for j in range(i - 1, -1, -1):
+                if result[j] is not None:
+                    prev_idx = j
+                    break
+
+            # Find next known value
+            next_idx = None
+            for j in range(i + 1, n):
+                if result[j] is not None:
+                    next_idx = j
+                    break
+
+            # Interpolate if we have both neighbors
+            if prev_idx is not None and next_idx is not None:
+                prev_val = result[prev_idx]
+                next_val = result[next_idx]
+                # Type narrowing: we know these are not None from the search above
+                assert prev_val is not None and next_val is not None
+                fraction = (i - prev_idx) / (next_idx - prev_idx)
+                result[i] = prev_val + fraction * (next_val - prev_val)
+            # Otherwise leave as None (leading/trailing gap)
+
+        return result
 
     def _parse_duration(self, duration_str: str) -> timedelta | None:
         """Parse duration string to timedelta.
