@@ -18,6 +18,7 @@ from homeassistant.helpers.template import Template
 
 from ..const import (
     CONF_TOOLS_TIMEOUT,
+    CUSTOM_TOOL_HANDLER_MCP,
     CUSTOM_TOOL_HANDLER_REST,
     CUSTOM_TOOL_HANDLER_SERVICE,
     DEFAULT_TOOLS_TIMEOUT,
@@ -34,12 +35,13 @@ _LOGGER = logging.getLogger(__name__)
 class CustomToolHandler:
     """Factory for creating custom tools from configuration.
 
-    This class provides a factory method to create custom tool instances
+    This class provides factory methods to create custom tool instances
     based on the handler type specified in the configuration.
 
     Supported handler types:
         - rest: REST API calls with configurable HTTP methods, headers, and body
-        - service: Home Assistant service calls (future implementation)
+        - service: Home Assistant service calls
+        - mcp: MCP (Model Context Protocol) proxy to remote servers
 
     Example:
         config = {
@@ -52,23 +54,62 @@ class CustomToolHandler:
                 "method": "GET"
             }
         }
-        tool = CustomToolHandler.create_tool_from_config(hass, config)
+        tools = await CustomToolHandler.create_tools_from_config(hass, config)
+
+    For MCP handlers, the factory automatically returns multiple tools:
+        mcp_config = {
+            "name": "my_mcp_server",
+            "handler": {
+                "type": "mcp",
+                "server_url": "http://localhost:3000/mcp",
+                "timeout": 30
+            }
+        }
+        tools = await CustomToolHandler.create_tools_from_config(hass, mcp_config)
     """
 
     @staticmethod
-    def create_tool_from_config(
+    async def create_tools_from_config(
         hass: HomeAssistant,
         config: dict[str, Any],
-    ) -> BaseTool:
-        """Create a custom tool from configuration.
+    ) -> list[BaseTool]:
+        """Create custom tool(s) from configuration.
+
+        Dispatches to the appropriate handler based on config['handler']['type'].
+        For MCP handlers, returns multiple tools (one per remote tool).
+        For other handlers, returns a list with a single tool.
+
+        Callers should handle ValidationError for invalid config and
+        ToolExecutionError for runtime failures (e.g. MCP server unreachable).
 
         Args:
             hass: Home Assistant instance
-            config: Tool configuration dictionary containing:
-                - name: Tool name
-                - description: Tool description
-                - parameters: JSON Schema for tool parameters
-                - handler: Handler configuration with type and settings
+            config: Tool configuration dictionary
+
+        Returns:
+            List of BaseTool instances (one for REST/service, N for MCP)
+
+        Raises:
+            ValidationError: If configuration is invalid or handler type unsupported
+            ToolExecutionError: If MCP server discovery fails
+        """
+        handler_type = config.get("handler", {}).get("type", "")
+
+        if handler_type == CUSTOM_TOOL_HANDLER_MCP:
+            return await CustomToolHandler._create_mcp_tools_from_config(hass, config)
+
+        return [CustomToolHandler._create_tool_from_config(hass, config)]
+
+    @staticmethod
+    def _create_tool_from_config(
+        hass: HomeAssistant,
+        config: dict[str, Any],
+    ) -> BaseTool:
+        """Create a single custom tool from configuration (non-MCP handlers).
+
+        Args:
+            hass: Home Assistant instance
+            config: Tool configuration dictionary
 
         Returns:
             BaseTool instance configured according to the handler type
@@ -76,7 +117,6 @@ class CustomToolHandler:
         Raises:
             ValidationError: If configuration is invalid or handler type unsupported
         """
-        # Validate required configuration keys
         required_keys = ["name", "description", "handler"]
         missing_keys = [key for key in required_keys if key not in config]
         if missing_keys:
@@ -84,7 +124,6 @@ class CustomToolHandler:
                 f"Custom tool configuration missing required keys: {', '.join(missing_keys)}"
             )
 
-        # If parameters not provided, use empty object schema
         if "parameters" not in config:
             config["parameters"] = {"type": "object", "properties": {}, "required": []}
 
@@ -94,7 +133,6 @@ class CustomToolHandler:
 
         handler_type = handler_config["type"]
 
-        # Create tool based on handler type
         if handler_type == CUSTOM_TOOL_HANDLER_REST:
             return RestCustomTool(hass, config)
         if handler_type == CUSTOM_TOOL_HANDLER_SERVICE:
@@ -102,7 +140,34 @@ class CustomToolHandler:
 
         raise ValidationError(
             f"Unknown handler type: '{handler_type}'. "
-            f"Supported types: {CUSTOM_TOOL_HANDLER_REST}, {CUSTOM_TOOL_HANDLER_SERVICE}"
+            f"Supported types: {CUSTOM_TOOL_HANDLER_REST}, "
+            f"{CUSTOM_TOOL_HANDLER_SERVICE}, {CUSTOM_TOOL_HANDLER_MCP}"
+        )
+
+    @staticmethod
+    async def _create_mcp_tools_from_config(
+        hass: HomeAssistant,
+        config: dict[str, Any],
+    ) -> list[BaseTool]:
+        """Create MCP tool wrappers from configuration.
+
+        Args:
+            hass: Home Assistant instance
+            config: MCP tool configuration dictionary
+
+        Returns:
+            List of MCP tool wrappers (one per remote tool)
+
+        Raises:
+            ValidationError: If configuration is invalid
+            ToolExecutionError: If connection or discovery fails
+        """
+        from .mcp_proxy import MCPProxyFactory
+
+        return await MCPProxyFactory.create_tools_from_config(
+            hass=hass,
+            config=config["handler"],
+            name=config["name"],
         )
 
 

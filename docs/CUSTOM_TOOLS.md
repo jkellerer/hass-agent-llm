@@ -9,6 +9,7 @@ This guide explains how to create and configure custom tools for Home Agent, all
 - [Tool Types](#tool-types)
   - [REST Handler](#rest-handler)
   - [Service Handler](#service-handler)
+  - [MCP Handler](#mcp-handler)
 - [Tool Schema](#tool-schema)
 - [REST Handler Guide](#rest-handler-guide)
 - [Service Handler Guide](#service-handler-guide)
@@ -73,6 +74,69 @@ Calls Home Assistant services to control devices, trigger automations, run scrip
 - Call specialized Home Assistant services
 - Chain multiple actions together
 
+### MCP Handler
+
+Connects to external MCP (Model Context Protocol) servers and exposes their tools locally. The MCP handler discovers available tools from the remote server and creates local wrappers, with optional regex-based filtering to include or exclude specific tools.
+
+**Use cases:**
+
+- Integrate with external MCP servers (AgentBrowser, Slack, databases, etc.)
+- Access remote tool catalogs without local installation
+- Filter and expose only relevant tools from large MCP servers
+
+#### Configuration Options
+
+```yaml
+handler:
+  type: mcp
+  server_url: "https://mcp-server.example.com/mcp"  # Required
+  headers:  # Optional
+    Authorization: "Bearer {{ secrets.mcp_api_key }}"
+  timeout: 30  # Optional (seconds, defaults to 60)
+  transport: streamable_http  # Optional (only streamable_http is supported)
+  tool_include:  # Optional - regex patterns to include
+    - "^weather_"
+    - "forecast"
+  tool_exclude:  # Optional - regex patterns to exclude
+    - "internal.*"
+    - ".*debug.*"
+```
+
+#### Tool Filtering
+
+The MCP handler supports regex-based filtering to control which remote tools are exposed locally:
+
+- **`tool_include`**: List of regex patterns. Only tools matching at least one pattern are included.
+- **`tool_exclude`**: List of regex patterns. Tools matching any pattern are excluded.
+- **Exclude takes precedence**: If a tool matches both include and exclude patterns, it is excluded.
+- **Default behavior**: If neither include nor exclude is specified, all tools are allowed.
+- **Patterns use `re.search()`**: Patterns match anywhere in the tool name (use `^` and `$` for anchoring).
+
+#### Filtering Examples
+
+Include only weather-related tools:
+
+```yaml
+handler:
+  type: mcp
+  server_url: "https://mcp-server.example.com/mcp"
+  tool_include:
+    - "^weather_"
+    - "forecast"
+```
+
+Include weather tools but disallow adjusting the location (e.g. a tool named `set_weather_location` is excluded):
+
+```yaml
+handler:
+  type: mcp
+  server_url: "https://mcp-server.example.com/mcp"
+  tool_include:
+    - "weather"
+  tool_exclude:
+    - ".*location.*"
+```
+
 ## Tool Schema
 
 Every custom tool must have the following fields:
@@ -81,8 +145,16 @@ Every custom tool must have the following fields:
 |-------|----------|-------------|
 | `name` | Yes | Unique identifier for the tool (lowercase, underscore-separated) |
 | `description` | Yes | Clear description of what the tool does (helps LLM decide when to use it) |
-| `parameters` | No | JSON Schema defining the tool's input parameters (defaults to empty object) |
+| `parameters` | No | JSON Schema defining the tool's input parameters (defaults to empty object; not needed for MCP as schemas come from the server) |
 | `handler` | Yes | Handler configuration (type + handler-specific settings) |
+
+### Handler Types
+
+| Type | Description |
+|------|-------------|
+| `rest` | Call external REST APIs |
+| `service` | Call Home Assistant services |
+| `mcp` | Connect to external MCP servers |
 
 ### Parameter Schema
 

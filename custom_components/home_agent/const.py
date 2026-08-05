@@ -343,6 +343,22 @@ CUSTOM_TOOL_HANDLER_REST: Final = "rest"
 CUSTOM_TOOL_HANDLER_SERVICE: Final = "service"
 CUSTOM_TOOL_HANDLER_SCRIPT: Final = "script"
 CUSTOM_TOOL_HANDLER_TEMPLATE: Final = "template"
+CUSTOM_TOOL_HANDLER_MCP: Final = "mcp"
+
+# MCP (Model Context Protocol) configuration keys
+CONF_MCP_SERVER_URL: Final = "server_url"
+CONF_MCP_HEADERS: Final = "headers"
+CONF_MCP_TIMEOUT: Final = "timeout"
+CONF_MCP_TRANSPORT: Final = "transport"
+CONF_MCP_TOOL_INCLUDE: Final = "tool_include"
+CONF_MCP_TOOL_EXCLUDE: Final = "tool_exclude"
+
+# MCP transport types
+MCP_TRANSPORT_STREAMABLE_HTTP: Final = "streamable_http"
+
+# Default values - MCP
+DEFAULT_MCP_TIMEOUT: Final = 30  # seconds
+DEFAULT_MCP_TRANSPORT: Final = MCP_TRANSPORT_STREAMABLE_HTTP
 
 # Domain service mappings - defines which services are available for each domain
 # and which services require specific entity features.

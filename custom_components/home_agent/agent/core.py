@@ -275,7 +275,7 @@ class HomeAgent(
                     break
         return self._memory_manager
 
-    def _ensure_tools_registered(self) -> None:
+    async def _ensure_tools_registered(self) -> None:
         """Ensure tools are registered (lazy registration).
 
         This method is called before the first message is processed to ensure
@@ -284,7 +284,7 @@ class HomeAgent(
         if self._tools_registered:
             return
 
-        self._register_tools()
+        await self._register_tools()
         self._tools_registered = True
 
         # Set memory provider in context manager if memory manager is available
@@ -332,7 +332,7 @@ class HomeAgent(
         """
         try:
             # Ensure tools are registered (lazy initialization)
-            self._ensure_tools_registered()
+            await self._ensure_tools_registered()
 
             # Check if we can stream
             if self._can_stream():
@@ -478,7 +478,7 @@ class HomeAgent(
                 conversation_id=user_input.conversation_id,
             )
 
-    def _register_tools(self) -> None:
+    async def _register_tools(self) -> None:
         """Register core Home Assistant tools."""
         # Get exposed entities from voice assistant settings
         # Use async_should_expose to respect Home Assistant's exposure settings
@@ -514,7 +514,7 @@ class HomeAgent(
         # Register custom tools from configuration
         custom_tools_config = self.config.get(CONF_TOOLS_CUSTOM, [])
         if custom_tools_config:
-            self._register_custom_tools(custom_tools_config)
+            await self._register_custom_tools(custom_tools_config)
 
         # Register memory tools if memory manager is available
         if self.memory_manager is not None:
@@ -534,47 +534,60 @@ class HomeAgent(
 
         _LOGGER.debug("Registered %d tools", len(self.tool_handler.get_registered_tools()))
 
-    def _register_custom_tools(self, custom_tools_config: list[dict[str, Any]]) -> None:
+    async def _register_custom_tools(
+        self, custom_tools_config: list[dict[str, Any]]
+    ) -> None:
         """Register custom tools from configuration.
+
+        Uses the unified CustomToolHandler.create_tools_from_config factory
+        which handles all handler types (REST, service, MCP).
 
         Args:
             custom_tools_config: List of custom tool configuration dictionaries
         """
-        from ..exceptions import ValidationError
+        from ..exceptions import ToolExecutionError, ValidationError
 
         registered_count = 0
         failed_count = 0
 
         for tool_config in custom_tools_config:
+            handler_type = tool_config.get("handler", {}).get("type", "")
+            config_name = tool_config.get("name", "unknown")
+
             try:
-                # Create tool from configuration
-                custom_tool = CustomToolHandler.create_tool_from_config(
+                tools = await CustomToolHandler.create_tools_from_config(
                     self.hass,
                     tool_config,
                 )
 
-                # Register with tool handler
-                self.tool_handler.register_tool(custom_tool)
-                registered_count += 1
-
-                _LOGGER.info(
-                    "Registered custom tool '%s' (type: %s)",
-                    custom_tool.name,
-                    tool_config.get("handler", {}).get("type"),
-                )
+                for custom_tool in tools:
+                    self.tool_handler.register_tool(custom_tool)
+                    registered_count += 1
+                    _LOGGER.info(
+                        "Registered custom tool '%s' (type: %s)",
+                        custom_tool.name,
+                        handler_type,
+                    )
 
             except ValidationError as err:
                 failed_count += 1
                 _LOGGER.error(
-                    "Failed to register custom tool (validation error): %s. "
-                    "Integration will continue without this tool.",
+                    "Failed to register custom tool '%s' (validation error): %s",
+                    config_name,
+                    err,
+                )
+            except ToolExecutionError as err:
+                failed_count += 1
+                _LOGGER.error(
+                    "Failed to register custom tool '%s' (execution error): %s",
+                    config_name,
                     err,
                 )
             except Exception as err:
                 failed_count += 1
                 _LOGGER.error(
-                    "Failed to register custom tool (unexpected error): %s. "
-                    "Integration will continue without this tool.",
+                    "Failed to register custom tool '%s' (unexpected error): %s",
+                    config_name,
                     err,
                     exc_info=True,
                 )
@@ -856,7 +869,7 @@ class HomeAgent(
             HomeAgentError: If processing fails
         """
         # Ensure tools are registered (lazy initialization)
-        self._ensure_tools_registered()
+        await self._ensure_tools_registered()
 
         start_time = time.time()
 

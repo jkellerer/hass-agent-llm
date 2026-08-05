@@ -1,11 +1,14 @@
 """Unit tests for CustomToolHandler."""
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from custom_components.home_agent.const import CUSTOM_TOOL_HANDLER_SERVICE
-from custom_components.home_agent.exceptions import ValidationError
+from custom_components.home_agent.const import (
+    CUSTOM_TOOL_HANDLER_MCP,
+    CUSTOM_TOOL_HANDLER_SERVICE,
+)
+from custom_components.home_agent.exceptions import ToolExecutionError, ValidationError
 from custom_components.home_agent.tools.custom import (
     CustomToolHandler,
     RestCustomTool,
@@ -16,7 +19,8 @@ from custom_components.home_agent.tools.custom import (
 class TestCustomToolHandler:
     """Test the CustomToolHandler factory class."""
 
-    def test_create_rest_tool_success(self, mock_hass):
+    @pytest.mark.asyncio
+    async def test_create_rest_tool_success(self, mock_hass):
         """Test successful creation of REST custom tool."""
         config = {
             "name": "check_weather",
@@ -33,24 +37,28 @@ class TestCustomToolHandler:
             },
         }
 
-        tool = CustomToolHandler.create_tool_from_config(mock_hass, config)
+        tools = await CustomToolHandler.create_tools_from_config(mock_hass, config)
 
+        assert len(tools) == 1
+        tool = tools[0]
         assert isinstance(tool, RestCustomTool)
         assert tool.name == "check_weather"
         assert tool.description == "Get weather forecast"
 
-    def test_create_tool_missing_required_keys(self, mock_hass):
+    @pytest.mark.asyncio
+    async def test_create_tool_missing_required_keys(self, mock_hass):
         """Test that creation fails when required keys are missing."""
         # Missing 'description'
         config = {"name": "test_tool", "parameters": {}, "handler": {"type": "rest"}}
 
         with pytest.raises(ValidationError) as exc_info:
-            CustomToolHandler.create_tool_from_config(mock_hass, config)
+            await CustomToolHandler.create_tools_from_config(mock_hass, config)
 
         assert "missing required keys" in str(exc_info.value).lower()
         assert "description" in str(exc_info.value).lower()
 
-    def test_create_tool_missing_handler_type(self, mock_hass):
+    @pytest.mark.asyncio
+    async def test_create_tool_missing_handler_type(self, mock_hass):
         """Test that creation fails when handler type is missing."""
         config = {
             "name": "test_tool",
@@ -60,11 +68,12 @@ class TestCustomToolHandler:
         }
 
         with pytest.raises(ValidationError) as exc_info:
-            CustomToolHandler.create_tool_from_config(mock_hass, config)
+            await CustomToolHandler.create_tools_from_config(mock_hass, config)
 
         assert "type" in str(exc_info.value).lower()
 
-    def test_create_tool_unsupported_handler_type(self, mock_hass):
+    @pytest.mark.asyncio
+    async def test_create_tool_unsupported_handler_type(self, mock_hass):
         """Test that creation fails for unsupported handler types."""
         config = {
             "name": "test_tool",
@@ -74,11 +83,12 @@ class TestCustomToolHandler:
         }
 
         with pytest.raises(ValidationError) as exc_info:
-            CustomToolHandler.create_tool_from_config(mock_hass, config)
+            await CustomToolHandler.create_tools_from_config(mock_hass, config)
 
         assert "unknown handler type" in str(exc_info.value).lower()
 
-    def test_create_tool_service_handler(self, mock_hass):
+    @pytest.mark.asyncio
+    async def test_create_tool_service_handler(self, mock_hass):
         """Test that service handler creates ServiceCustomTool."""
         # Mock has_service to return True
         mock_hass.services.has_service = MagicMock(return_value=True)
@@ -93,11 +103,105 @@ class TestCustomToolHandler:
             },
         }
 
-        tool = CustomToolHandler.create_tool_from_config(mock_hass, config)
+        tools = await CustomToolHandler.create_tools_from_config(mock_hass, config)
 
+        assert len(tools) == 1
+        tool = tools[0]
         assert isinstance(tool, ServiceCustomTool)
         assert tool.name == "test_tool"
         assert tool.description == "Test tool"
+
+    @pytest.mark.asyncio
+    async def test_create_mcp_tools_success(self, mock_hass):
+        """Test that MCP handler creates MCPToolWrapper instances."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock, patch
+        from custom_components.home_agent.tools.mcp_proxy import MCPToolWrapper
+
+        # Create proper mock session with async context manager
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(return_value={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [
+                    {
+                        "name": "remote_weather",
+                        "description": "Get remote weather",
+                        "inputSchema": {"type": "object", "properties": {"location": {"type": "string"}}}
+                    }
+                ]
+            }
+        })
+
+        @asynccontextmanager
+        async def post_context(*args, **kwargs):
+            yield mock_response
+
+        mock_session.post = post_context
+
+        config = {
+            "name": "weather_mcp",
+            "description": "MCP weather proxy",
+            "parameters": {},
+            "handler": {
+                "type": CUSTOM_TOOL_HANDLER_MCP,
+                "server_url": "https://mcp-server.example.com/mcp",
+                "timeout": 30,
+            },
+        }
+
+        with patch(
+            "homeassistant.helpers.aiohttp_client.async_get_clientsession",
+            return_value=mock_session
+        ):
+            tools = await CustomToolHandler.create_tools_from_config(mock_hass, config)
+
+        assert len(tools) == 1
+        assert isinstance(tools[0], MCPToolWrapper)
+        assert "remote_weather" in tools[0].name
+
+    @pytest.mark.asyncio
+    async def test_create_mcp_tools_missing_server_url(self, mock_hass):
+        """Test MCP tool creation fails without server_url."""
+        config = {
+            "name": "bad_mcp",
+            "description": "Missing URL",
+            "parameters": {},
+            "handler": {
+                "type": CUSTOM_TOOL_HANDLER_MCP,
+            },
+        }
+
+        with pytest.raises(ToolExecutionError):
+            await CustomToolHandler.create_tools_from_config(mock_hass, config)
+
+    @pytest.mark.asyncio
+    async def test_create_mcp_tools_server_unreachable(self, mock_hass):
+        """Test MCP tool creation fails when server is unreachable."""
+        from unittest.mock import patch
+        import aiohttp
+        mock_session = AsyncMock()
+        mock_session.post.side_effect = aiohttp.ClientError("Connection failed")
+
+        config = {
+            "name": "bad_mcp",
+            "description": "Unreachable server",
+            "parameters": {},
+            "handler": {
+                "type": CUSTOM_TOOL_HANDLER_MCP,
+                "server_url": "https://broken.example.com/mcp",
+            },
+        }
+
+        with patch(
+            "homeassistant.helpers.aiohttp_client.async_get_clientsession",
+            return_value=mock_session
+        ):
+            with pytest.raises(ToolExecutionError):
+                await CustomToolHandler.create_tools_from_config(mock_hass, config)
 
 
 class TestRestCustomToolInitialization:

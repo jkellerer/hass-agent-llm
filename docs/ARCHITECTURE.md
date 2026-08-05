@@ -43,8 +43,13 @@ graph TB
         HAControl[HomeAssistantControlTool<br/>Device Control]
         HAQuery[HomeAssistantQueryTool<br/>State Queries]
         ExternalLLM[ExternalLLMTool<br/>Delegate to Other LLM]
-        CustomTools[CustomToolHandler<br/>REST/Service Tools]
+        CustomTools[CustomToolHandler<br/>REST/Service/MCP Tools]
+        MCPProxy[MCPProxyFactory<br/>MCP Tool Wrappers]
         MemoryTools[Memory Tools<br/>Store/Recall]
+    end
+
+    subgraph "External MCP"
+        MCPServer[MCP Server<br/>Streamable HTTP]
     end
 
     subgraph "Storage & External"
@@ -72,12 +77,14 @@ graph TB
     ToolHandler --> HAQuery
     ToolHandler --> ExternalLLM
     ToolHandler --> CustomTools
+    ToolHandler --> MCPProxy
     ToolHandler --> MemoryTools
 
     HAControl --> Services
     HAQuery --> Entities
     CustomTools --> Services
     MemoryTools --> MemoryMgr
+    MCPProxy --> MCPServer
 
     Agent -->|API calls| LLM
     ConvHistory --> HAStore
