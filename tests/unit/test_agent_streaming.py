@@ -389,16 +389,19 @@ class TestStreamingMemoryExtraction:
 
     @pytest.mark.asyncio
     async def test_memory_extraction_triggered_after_streaming(self, agent, mock_hass):
-        """Test that memory extraction is triggered after streaming completes."""
+        """Test that memory extraction is scheduled after streaming completes."""
         from custom_components.home_agent.const import (
             CONF_MEMORY_ENABLED,
             CONF_MEMORY_EXTRACTION_ENABLED,
+            CONF_MEMORY_EXTRACTION_MODE,
+            MEMORY_EXTRACTION_MODE_IMMEDIATE,
         )
 
         # Enable streaming and memory extraction
         agent.config[CONF_STREAMING_ENABLED] = True
         agent.config[CONF_MEMORY_ENABLED] = True
         agent.config[CONF_MEMORY_EXTRACTION_ENABLED] = True
+        agent.config[CONF_MEMORY_EXTRACTION_MODE] = MEMORY_EXTRACTION_MODE_IMMEDIATE
 
         # Create mock conversation input
         mock_input = MagicMock(spec=ha_conversation.ConversationInput)
@@ -436,8 +439,8 @@ class TestStreamingMemoryExtraction:
             ) as mock_chat_log,
             patch.object(agent, "_call_llm_streaming") as mock_stream,
             patch.object(
-                agent, "_extract_and_store_memories", new_callable=AsyncMock
-            ) as mock_extract,
+                agent, "_schedule_extraction"
+            ) as mock_schedule,
             patch(
                 "homeassistant.components.conversation.async_get_result_from_chat_log",
                 return_value=mock_result,
@@ -454,14 +457,9 @@ class TestStreamingMemoryExtraction:
             # Call async_process with streaming
             result = await agent.async_process(mock_input)
 
-            # Wait a moment for the async task to be created
-            import asyncio
-
-            await asyncio.sleep(0.1)
-
-            # Verify memory extraction was triggered
-            mock_extract.assert_called_once()
-            call_args = mock_extract.call_args[1]
+            # Verify _schedule_extraction was called with correct kwargs
+            mock_schedule.assert_called_once()
+            call_args = mock_schedule.call_args[0][0]
             assert call_args["conversation_id"] == "test-conv"
             assert call_args["user_message"] == "Remember that I like pizza"
             assert call_args["assistant_response"] == "I'll remember that you like pizza!"

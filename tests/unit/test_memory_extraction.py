@@ -232,6 +232,7 @@ class TestParseAndStoreMemories:
                     "content": (
                         "User prefers bedroom temperature at 68°F"
                         " for sleeping comfort during nighttime"
+                        " hours when the family is resting"
                     ),
                     "importance": 0.8,
                     "entities": ["climate.bedroom"],
@@ -543,25 +544,45 @@ class TestExtractAndStoreMemories:
     """Test _extract_and_store_memories method."""
 
     async def test_extraction_disabled_when_memory_disabled(self, home_agent):
-        """Test that extraction is skipped when memory is disabled."""
+        """Test that extraction is skipped when memory is disabled.
+        
+        With early-exit guards in _schedule_extraction, the method never
+        schedules extraction when memory is disabled.
+        """
         home_agent.config[CONF_MEMORY_ENABLED] = False
 
+        # _schedule_extraction should return early without scheduling
         with patch.object(home_agent, "_build_extraction_prompt") as mock_build:
-            await home_agent._extract_and_store_memories(
-                "conv_123", "user msg", "assistant msg", []
-            )
+            # Call _schedule_extraction (the entry point with guards)
+            home_agent._schedule_extraction({
+                "conversation_id": "conv_123",
+                "user_message": "This is a message with enough words to pass trivial check",
+                "assistant_response": "This is a response with enough words too",
+                "full_messages": [],
+            })
 
+            # No timer should be scheduled, so _build_extraction_prompt never called
             mock_build.assert_not_called()
 
     async def test_extraction_skipped_when_no_memory_manager(self, home_agent):
-        """Test that extraction is skipped when memory manager is not available."""
+        """Test that extraction is skipped when memory manager is not available.
+        
+        With early-exit guards in _schedule_extraction, the method never
+        schedules extraction when memory_manager is None.
+        """
         home_agent._memory_manager = None
 
+        # _schedule_extraction should return early without scheduling
         with patch.object(home_agent, "_build_extraction_prompt") as mock_build:
-            await home_agent._extract_and_store_memories(
-                "conv_123", "user msg", "assistant msg", []
-            )
+            # Call _schedule_extraction (the entry point with guards)
+            home_agent._schedule_extraction({
+                "conversation_id": "conv_123",
+                "user_message": "This is a message with enough words to pass trivial check",
+                "assistant_response": "This is a response with enough words too",
+                "full_messages": [],
+            })
 
+            # No timer should be scheduled, so _build_extraction_prompt never called
             mock_build.assert_not_called()
 
     async def test_extraction_with_local_llm(self, home_agent, mock_memory_manager):

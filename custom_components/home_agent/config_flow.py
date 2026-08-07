@@ -64,8 +64,11 @@ from .const import (
     CONF_MEMORY_COLLECTION_NAME,
     CONF_MEMORY_CONTEXT_TOP_K,
     CONF_MEMORY_ENABLED,
+    CONF_MEMORY_EXTRACTION_DELAY,
     CONF_MEMORY_EXTRACTION_ENABLED,
     CONF_MEMORY_EXTRACTION_LLM,
+    CONF_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+    CONF_MEMORY_EXTRACTION_MODE,
     CONF_MEMORY_MAX_MEMORIES,
     CONF_MEMORY_MIN_IMPORTANCE,
     CONF_MEMORY_MIN_WORDS,
@@ -121,9 +124,14 @@ from .const import (
     DEFAULT_MEMORY_COLLECTION_NAME,
     DEFAULT_MEMORY_CONTEXT_TOP_K,
     DEFAULT_MEMORY_ENABLED,
+    DEFAULT_MEMORY_EXTRACTION_DELAY,
     DEFAULT_MEMORY_EXTRACTION_ENABLED,
     DEFAULT_MEMORY_EXTRACTION_LLM,
+    DEFAULT_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+    DEFAULT_MEMORY_EXTRACTION_MODE,
     DEFAULT_MEMORY_MAX_MEMORIES,
+    MEMORY_EXTRACTION_MODE_IMMEDIATE,
+    MEMORY_EXTRACTION_MODE_IDLE,
     DEFAULT_MEMORY_MIN_IMPORTANCE,
     DEFAULT_MEMORY_MIN_WORDS,
     DEFAULT_NAME,
@@ -1362,6 +1370,36 @@ class HomeAgentOptionsFlow(config_entries.OptionsFlow):
                             ),
                         ),
                     ): str,
+                    vol.Required(
+                        CONF_MEMORY_EXTRACTION_MODE,
+                        default=current_options.get(
+                            CONF_MEMORY_EXTRACTION_MODE,
+                            current_data.get(
+                                CONF_MEMORY_EXTRACTION_MODE,
+                                DEFAULT_MEMORY_EXTRACTION_MODE,
+                            ),
+                        ),
+                    ): vol.In([MEMORY_EXTRACTION_MODE_IMMEDIATE, MEMORY_EXTRACTION_MODE_IDLE]),
+                    vol.Optional(
+                        CONF_MEMORY_EXTRACTION_DELAY,
+                        default=current_options.get(
+                            CONF_MEMORY_EXTRACTION_DELAY,
+                            current_data.get(
+                                CONF_MEMORY_EXTRACTION_DELAY,
+                                DEFAULT_MEMORY_EXTRACTION_DELAY,
+                            ),
+                        ),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=5, max=300)),
+                    vol.Optional(
+                        CONF_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+                        default=current_options.get(
+                            CONF_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+                            current_data.get(
+                                CONF_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+                                DEFAULT_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+                            ),
+                        ),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=1, max=50)),
                 }
             ),
             errors=errors,

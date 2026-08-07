@@ -10,6 +10,7 @@ import asyncio
 import logging
 import random
 import re
+import unicodedata
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -26,6 +27,69 @@ T = TypeVar("T")
 # Pre-compiled regex pattern for stripping thinking blocks from reasoning models
 # Matches <think>...</think> blocks including newlines (DOTALL flag)
 _THINKING_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def count_meaningful_words(
+    text: str,
+    min_word_length: int = 2,
+    limit: int | None = None,
+) -> int:
+    """Count meaningful words in text, with CJK awareness.
+
+    CJK characters (Chinese, Japanese, Korean) each count as a word since
+    they represent individual morphemes. Latin scripts are counted via
+    word boundaries using regex finditer with optional early-exit.
+
+    This is the single canonical implementation used by:
+    - MemoryExtractionMixin (turn filtering, min_word_length=2)
+    - MemoryValidator (memory content validation, min_word_length=3)
+
+    Args:
+        text: Text to count words in
+        min_word_length: Minimum character length for Latin words to count.
+            CJK characters always count regardless of this threshold
+            (each CJK char is already a meaningful morpheme).
+            Default 2 (filters single-char artifacts like "I", "a").
+            Use 3+ for stricter filtering (e.g. memory validation).
+        limit: If set, stop counting once this many words are reached
+            (early-exit optimization for min_length checks)
+
+    Returns:
+        Number of meaningful words (capped at limit if set)
+
+    Examples:
+        >>> count_meaningful_words("hello world")
+        2
+        >>> count_meaningful_words("你好世界")
+        4
+        >>> count_meaningful_words("I am here", min_word_length=2)
+        2  # "I" filtered (1 char < 2)
+        >>> count_meaningful_words("I am here", min_word_length=3)
+        1  # only "here" passes
+    """
+    count = 0
+
+    # Pass 1: CJK characters (each character = 1 word, unaffected by min_word_length)
+    for ch in text:
+        if unicodedata.name(ch, "").startswith(
+            ("CJK", "HANGUL", "HIRAGANA", "KATAKANA")
+        ):
+            count += 1
+            if limit is not None and count >= limit:
+                return count
+
+    # Pass 2: Latin word sequences
+    # Use [a-zA-Z]+ when CJK was found to avoid double-counting CJK chars
+    # Use \S+ (non-whitespace) for pure Latin to match split()-based tokenization
+    #   — "68°F" stays as one token, punctuation-attached words stay together
+    expression = r"[a-zA-Z]+" if count > 0 else r"\S+"
+    for m in re.finditer(expression, text):
+        if len(m.group()) >= min_word_length:
+            count += 1
+            if limit is not None and count >= limit:
+                return count
+
+    return count
 
 
 def render_template_value(hass: HomeAssistant, value: str) -> str:

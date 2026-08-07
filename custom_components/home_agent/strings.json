@@ -350,6 +350,9 @@
           "memory_max_memories": "Maximum Stored Memories",
           "memory_min_importance": "Minimum Importance (0.0-1.0)",
           "memory_min_words": "Minimum Words (1-50)",
+          "memory_extraction_mode": "Extraction Mode",
+          "memory_extraction_delay": "Extraction Delay (seconds)",
+          "memory_extraction_min_turn_length": "Minimum Turn Length",
           "memory_context_top_k": "Memories to Inject in Context",
           "memory_collection_name": "ChromaDB Collection Name"
         },
@@ -360,6 +363,9 @@
           "memory_max_memories": "Maximum number of memories to store (oldest/least important are removed when limit is reached)",
           "memory_min_importance": "Filter memories by LLM-assigned importance score. Lower values (0.2-0.3) keep most memories including casual mentions. Medium values (0.4-0.5) filter out minor details. Higher values (0.6-0.8) only keep significant preferences and facts. Default 0.4 provides balanced filtering.",
           "memory_min_words": "Minimum number of meaningful words required for a memory (filters out low-quality or too-brief memories)",
+          "memory_extraction_mode": "Controls when memory extraction runs: Immediate (after each turn), Idle (delayed after pause), or Conversation End (batched at conversation boundaries)",
+          "memory_extraction_delay": "Delay in seconds before extraction runs in Idle mode (0-300). Default is 30 seconds.",
+          "memory_extraction_min_turn_length": "Minimum number of meaningful words required in a turn to trigger extraction (0-50). Turns shorter than this are skipped to avoid trivial extractions. Set to 0 to disable.",
           "memory_context_top_k": "How many relevant memories to include in each conversation",
           "memory_collection_name": "Name of the ChromaDB collection for memory indexing"
         }

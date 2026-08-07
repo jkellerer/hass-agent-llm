@@ -103,6 +103,9 @@ CONF_MEMORY_IMPORTANCE_DECAY: Final = "memory_importance_decay"
 CONF_MEMORY_DEDUP_THRESHOLD: Final = "memory_dedup_threshold"
 CONF_MEMORY_EXTRACTION_ENABLED: Final = "memory_extraction_enabled"
 CONF_MEMORY_EXTRACTION_LLM: Final = "memory_extraction_llm"
+CONF_MEMORY_EXTRACTION_DELAY: Final = "memory_extraction_delay"
+CONF_MEMORY_EXTRACTION_MODE: Final = "memory_extraction_mode"
+CONF_MEMORY_EXTRACTION_MIN_TURN_LENGTH: Final = "memory_extraction_min_turn_length"
 CONF_MEMORY_CONTEXT_TOP_K: Final = "memory_context_top_k"
 CONF_MEMORY_EVENT_TTL: Final = "memory_event_ttl"
 CONF_MEMORY_FACT_TTL: Final = "memory_fact_ttl"
@@ -142,6 +145,14 @@ COMPRESSION_LEVEL_NONE: Final = "none"
 COMPRESSION_LEVEL_LOW: Final = "low"
 COMPRESSION_LEVEL_MEDIUM: Final = "medium"
 COMPRESSION_LEVEL_HIGH: Final = "high"
+
+# Memory extraction modes
+MEMORY_EXTRACTION_MODE_IMMEDIATE: Final = "immediate"
+MEMORY_EXTRACTION_MODE_IDLE: Final = "idle"
+MEMORY_EXTRACTION_MODES: Final = [
+    MEMORY_EXTRACTION_MODE_IMMEDIATE,
+    MEMORY_EXTRACTION_MODE_IDLE,
+]
 
 # Embedding providers
 EMBEDDING_PROVIDER_OPENAI: Final = "openai"
@@ -239,12 +250,16 @@ DEFAULT_MEMORY_IMPORTANCE_DECAY: Final = 0.0  # No decay by default
 DEFAULT_MEMORY_DEDUP_THRESHOLD: Final = 0.85  # Lowered to catch near-duplicate memories
 DEFAULT_MEMORY_EXTRACTION_ENABLED: Final = True
 DEFAULT_MEMORY_EXTRACTION_LLM: Final = "external"  # "external" or "local"
+DEFAULT_MEMORY_EXTRACTION_DELAY: Final = 30  # 30 seconds idle before extraction
+DEFAULT_MEMORY_EXTRACTION_MODE: Final = "idle"  # "immediate", "idle", "conversation_end"
+DEFAULT_MEMORY_EXTRACTION_MIN_TURN_LENGTH: Final = 4  # Minimum words to trigger extraction
 DEFAULT_MEMORY_CONTEXT_TOP_K: Final = 5
 DEFAULT_MEMORY_EVENT_TTL: Final = 300  # 5 minutes for events (in seconds)
 DEFAULT_MEMORY_FACT_TTL: Final = None  # No expiration for facts
 DEFAULT_MEMORY_PREFERENCE_TTL: Final = 7776000  # 90 days for preferences
 DEFAULT_MEMORY_CLEANUP_INTERVAL: Final = 300  # Run cleanup every 5 minutes
 DEFAULT_MEMORY_MIN_WORDS: Final = 10
+DEFAULT_MEMORY_MIN_WORD_LENGTH: Final = 3  # Min chars for a word to count in memory validation (3+ vs 2+ for turns)
 DEFAULT_MEMORY_QUALITY_VALIDATION_ENABLED: Final = True
 DEFAULT_MEMORY_QUALITY_VALIDATION_INTERVAL: Final = 3600  # Run quality validation every hour
 

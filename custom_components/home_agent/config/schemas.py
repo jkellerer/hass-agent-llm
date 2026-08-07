@@ -44,6 +44,11 @@ from ..const import (
     CONF_MEMORY_ENABLED,
     CONF_MEMORY_EXTRACTION_ENABLED,
     CONF_MEMORY_EXTRACTION_LLM,
+    CONF_MEMORY_EXTRACTION_DELAY,
+    CONF_MEMORY_EXTRACTION_MODE,
+    CONF_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+    MEMORY_EXTRACTION_MODE_IMMEDIATE,
+    MEMORY_EXTRACTION_MODE_IDLE,
     CONF_MEMORY_MAX_MEMORIES,
     CONF_MEMORY_MIN_IMPORTANCE,
     CONF_OPENAI_API_KEY,
@@ -92,6 +97,9 @@ from ..const import (
     DEFAULT_MEMORY_ENABLED,
     DEFAULT_MEMORY_EXTRACTION_ENABLED,
     DEFAULT_MEMORY_EXTRACTION_LLM,
+    DEFAULT_MEMORY_EXTRACTION_DELAY,
+    DEFAULT_MEMORY_EXTRACTION_MODE,
+    DEFAULT_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
     DEFAULT_MEMORY_MAX_MEMORIES,
     DEFAULT_MEMORY_MIN_IMPORTANCE,
     DEFAULT_NAME,
@@ -669,6 +677,39 @@ def get_memory_settings_schema(
                     ),
                 ),
             ): str,
+            vol.Optional(
+                CONF_MEMORY_EXTRACTION_MODE,
+                default=current_options.get(
+                    CONF_MEMORY_EXTRACTION_MODE,
+                    current_data.get(
+                        CONF_MEMORY_EXTRACTION_MODE,
+                        DEFAULT_MEMORY_EXTRACTION_MODE,
+                    ),
+                ),
+            ): vol.In([
+                MEMORY_EXTRACTION_MODE_IMMEDIATE,
+                MEMORY_EXTRACTION_MODE_IDLE,
+            ]),
+            vol.Optional(
+                CONF_MEMORY_EXTRACTION_DELAY,
+                default=current_options.get(
+                    CONF_MEMORY_EXTRACTION_DELAY,
+                    current_data.get(
+                        CONF_MEMORY_EXTRACTION_DELAY,
+                        DEFAULT_MEMORY_EXTRACTION_DELAY,
+                    ),
+                ),
+            ): vol.All(vol.Coerce(int), vol.Range(min=10, max=300)),
+            vol.Optional(
+                CONF_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+                default=current_options.get(
+                    CONF_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+                    current_data.get(
+                        CONF_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+                        DEFAULT_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+                    ),
+                ),
+            ): vol.All(vol.Coerce(int), vol.Range(min=0, max=50)),
         }
     )
 

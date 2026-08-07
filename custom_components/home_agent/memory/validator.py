@@ -53,6 +53,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ..helpers import count_meaningful_words
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -212,15 +214,20 @@ class MemoryValidator:
         self,
         min_word_count: int = 10,
         min_importance: float = 0.4,
+        min_word_length: int = 3,
     ) -> None:
         """Initialize the memory validator.
 
         Args:
             min_word_count: Minimum meaningful words required (default: 10)
             min_importance: Minimum importance score (default: 0.4)
+            min_word_length: Minimum character length for Latin words to count.
+                CJK characters always count regardless (each is a morpheme).
+                Default 3 for memory validation (stricter than turn filtering).
         """
         self.min_word_count = min_word_count
         self.min_importance = min_importance
+        self.min_word_length = min_word_length
 
     def validate(self, memory: dict[str, Any]) -> tuple[bool, str]:
         """Validate a memory against quality criteria.
@@ -316,7 +323,8 @@ class MemoryValidator:
     def _validate_word_count(self, content: str) -> tuple[bool, str]:
         """Validate minimum word count.
 
-        Counts only meaningful words (>2 chars) to filter filler words.
+        Counts meaningful words using CJK-aware unified counting with
+        configurable min_word_length threshold (default: 3 chars for memories).
 
         Args:
             content: Memory content
@@ -324,9 +332,9 @@ class MemoryValidator:
         Returns:
             Tuple of (is_valid, rejection_reason)
         """
-        words = content.split()
-        meaningful_words = [w for w in words if len(w) > 2]
-        meaningful_word_count = len(meaningful_words)
+        meaningful_word_count = count_meaningful_words(
+            content, min_word_length=self.min_word_length
+        )
 
         if meaningful_word_count < self.min_word_count:
             return False, f"too_short:{meaningful_word_count}"

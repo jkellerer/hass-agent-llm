@@ -1473,14 +1473,14 @@ class HomeAgent(
                     break
 
             if final_response:
-                self.hass.async_create_task(
-                    self._extract_and_store_memories(
-                        conversation_id=conversation_id,
-                        user_message=user_message,
-                        assistant_response=final_response,
-                        full_messages=messages,
-                    )
-                )
+                # Use new extraction scheduling with debounce and heuristics
+                extraction_kwargs = {
+                    "conversation_id": conversation_id,
+                    "user_message": user_message,
+                    "assistant_response": final_response,
+                    "full_messages": messages,
+                }
+                self._schedule_extraction(extraction_kwargs)
 
         # Calculate total duration
         duration_ms = int((time.time() - start_time) * 1000)
@@ -1781,14 +1781,14 @@ class HomeAgent(
                 if self.config.get(
                     CONF_MEMORY_EXTRACTION_ENABLED, DEFAULT_MEMORY_EXTRACTION_ENABLED
                 ):
-                    self.hass.async_create_task(
-                        self._extract_and_store_memories(
-                            conversation_id=conversation_id,
-                            user_message=user_message,
-                            assistant_response=final_content,
-                            full_messages=messages,
-                        )
-                    )
+                    # Use new extraction scheduling with debounce and heuristics
+                    extraction_kwargs = {
+                        "conversation_id": conversation_id,
+                        "user_message": user_message,
+                        "assistant_response": final_content,
+                        "full_messages": messages,
+                    }
+                    self._schedule_extraction(extraction_kwargs)
 
                 return final_content
 

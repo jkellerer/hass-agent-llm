@@ -12,6 +12,7 @@ from homeassistant.core import State
 
 from custom_components.home_agent.exceptions import ValidationError
 from custom_components.home_agent.helpers import (
+    count_meaningful_words,
     estimate_tokens,
     format_duration,
     format_entity_state,
@@ -23,6 +24,107 @@ from custom_components.home_agent.helpers import (
     truncate_text,
     validate_entity_id,
 )
+
+
+class TestCountMeaningfulWords:
+    """Test CJK-aware word counting with min_word_length and early-exit.
+
+    This is the single canonical implementation used by:
+    - MemoryExtractionMixin (turn filtering, min_word_length=2)
+    - MemoryValidator (memory content validation, min_word_length=3)
+    """
+
+    # -- CJK character counting --
+
+    def test_chinese_characters_counted_individually(self):
+        """Test that Chinese characters are counted individually."""
+        assert count_meaningful_words("我的生日是三月") == 7
+        assert count_meaningful_words("你好") == 2
+        assert count_meaningful_words("测试") == 2
+
+    def test_japanese_hiragana_katakana_counted(self):
+        """Test that Japanese Hiragana/Katakana are counted individually."""
+        assert count_meaningful_words("こんにちは") == 5
+        assert count_meaningful_words("テスト") == 3
+        assert count_meaningful_words("カタカナ") == 4
+
+    def test_korean_hangul_counted(self):
+        """Test that Korean Hangul syllables are counted individually."""
+        assert count_meaningful_words("안녕하세요") == 5
+        assert count_meaningful_words("테스트") == 3
+
+    def test_cjk_ignores_min_word_length(self):
+        """Test that CJK characters count regardless of min_word_length."""
+        assert count_meaningful_words("你好世界", min_word_length=5) == 4
+        assert count_meaningful_words("こんにちは", min_word_length=10) == 5
+
+    def test_mixed_cjk_latin_counts_both(self):
+        """Test mixed CJK and Latin text counting."""
+        # 2 CJK chars + 2 Latin words = 4 tokens
+        assert count_meaningful_words("你好 hello world") == 4
+        # 1 CJK char + 1 Latin word = 2 tokens
+        assert count_meaningful_words("测 test") == 2
+
+    # -- Latin word counting --
+
+    def test_pure_latin_words(self):
+        """Test that pure Latin text uses regex word counting."""
+        assert count_meaningful_words("hello world") == 2
+        # "I"(1) filtered by default min_word_length=2; "prefer","the","bedroom","temperature" = 4
+        assert count_meaningful_words("I prefer the bedroom temperature") == 4
+
+    def test_min_word_length_filters_short_words(self):
+        """Test that min_word_length filters out short Latin words."""
+        # All words < 3 chars -> 0 meaningful words
+        assert count_meaningful_words("I am at go an be", min_word_length=3) == 0
+
+        # "the and for" -> all == 3 chars -> 3 meaningful words
+        assert count_meaningful_words("the and for", min_word_length=3) == 3
+
+    def test_min_word_length_2_allows_two_char_words(self):
+        """Test that min_word_length=2 allows 2-char words."""
+        # "am"(2), "at"(2), "go"(2) pass; "I"(1) filtered
+        assert count_meaningful_words("I am at go", min_word_length=2) == 3
+
+        assert count_meaningful_words("a I", min_word_length=2) == 0
+
+    def test_latin_word_counting_with_min_length(self):
+        """Test Latin word counting respects min_word_length."""
+        # "Hello"(5), "world"(5), "the"(3) = 3; "is"(2) filtered
+        assert (
+            count_meaningful_words("Hello world is the", min_word_length=3) == 3
+        )
+
+    def test_default_min_word_length_is_2(self):
+        """Test that default min_word_length is 2."""
+        # "am"(2), "at"(2) pass; "I"(1) filtered
+        assert count_meaningful_words("I am at") == 2
+
+    # -- Early-exit with limit --
+
+    def test_early_exit_with_limit_cjk(self):
+        """Test that early-exit stops counting CJK at the limit."""
+        # 7 chars, limit=3 should return 3
+        assert count_meaningful_words("我的生日是三月", limit=3) == 3
+
+    def test_early_exit_with_limit_latin(self):
+        """Test that early-exit stops counting Latin words at the limit."""
+        # 5 words, limit=2 should return 2
+        assert (
+            count_meaningful_words(
+                "I prefer the bedroom temperature", limit=2
+            )
+            == 2
+        )
+
+    def test_no_limit_returns_full_count(self):
+        """Test that without limit, full count is returned."""
+        assert count_meaningful_words("我的生日是三月", limit=None) == 7
+        assert count_meaningful_words("hello world test", limit=None) == 3
+
+    def test_limit_exceeds_total(self):
+        """Test that limit higher than total returns full count."""
+        assert count_meaningful_words("hello world", limit=10) == 2
 
 
 class TestStripThinkingBlocks:

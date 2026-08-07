@@ -190,23 +190,35 @@ Error Handling:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ..const import (
     CONF_EMIT_EVENTS,
     CONF_EXTERNAL_LLM_ENABLED,
     CONF_MEMORY_ENABLED,
+    CONF_MEMORY_EXTRACTION_DELAY,
     CONF_MEMORY_EXTRACTION_LLM,
+    CONF_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+    CONF_MEMORY_EXTRACTION_MODE,
     CONF_MEMORY_MIN_IMPORTANCE,
     CONF_MEMORY_MIN_WORDS,
     DEFAULT_MEMORY_ENABLED,
+    DEFAULT_MEMORY_EXTRACTION_DELAY,
     DEFAULT_MEMORY_EXTRACTION_LLM,
+    DEFAULT_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+    DEFAULT_MEMORY_EXTRACTION_MODE,
+    DEFAULT_MEMORY_MIN_WORD_LENGTH,
     DEFAULT_MEMORY_MIN_WORDS,
+    MEMORY_EXTRACTION_MODE_IMMEDIATE,
+    MEMORY_EXTRACTION_MODE_IDLE,
     EVENT_MEMORY_EXTRACTED,
 )
-from ..helpers import strip_thinking_blocks
+from ..helpers import count_meaningful_words, strip_thinking_blocks
 from ..memory.validator import MemoryValidator
 
 if TYPE_CHECKING:
@@ -215,6 +227,32 @@ if TYPE_CHECKING:
     from ..tool_handler import ToolHandler
 
 _LOGGER = logging.getLogger(__name__)
+
+# How many _get_extraction_state() calls to skip between eviction sweeps.
+_EVICT_EVERY_N_CALLS = 20
+
+# Entries not accessed within this many seconds are considered stale.
+_EVICT_AFTER_SECONDS = 3600  # 1 hour
+
+
+@dataclass
+class MemoryExtractionState:
+    """Per-conversation scheduling state for memory extraction.
+
+    Holds everything that was previously spread across four separate dicts.
+    The `last_used` timestamp enables time-based eviction of stale entries
+    instead of insertion-order caps.
+    """
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    timer: asyncio.TimerHandle | None = None
+    last_turn: tuple[str, str] | None = None
+    pending_kwargs: dict[str, Any] | None = None
+    last_used: float = field(default_factory=time.monotonic)
+
+    def touch(self):
+        """Update last_used to now."""
+        self.last_used = time.monotonic()
 
 
 class MemoryExtractionMixin:
@@ -232,10 +270,319 @@ class MemoryExtractionMixin:
     tool_handler: "ToolHandler"
     _memory_validator: MemoryValidator | None = None
 
+    # Per-conversation scheduling state — single dict of state objects
+    _extraction_states: dict[str, MemoryExtractionState]
+
+    # Counter for periodic eviction (every _EVICT_EVERY_N_CALLS accesses)
+    _extraction_state_access_count: int = 0
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        """Initialize per-conversation state storage."""
+        super().__init__(*args, **kwargs)
+        self._init_memory_extraction()
+
     @property
     def memory_manager(self) -> Any:
-        """Get memory manager (provided by host class)."""
-        ...
+        """Get memory manager (provided by host class).
+
+        Returns _memory_manager if set, otherwise None.
+        Host classes (e.g. HomeAgent) override this with proper initialization.
+        """
+        return getattr(self, "_memory_manager", None)
+
+    def _init_memory_extraction(self):
+        """Initialize per-conversation state storage for memory extraction.
+
+        Uses hasattr guards so it's safe to call multiple times (lazy-init
+        pattern for mixin scenarios where __init__ may not have run yet).
+        """
+        if not hasattr(self, "_extraction_states"):
+            self._extraction_states = {}
+        if not hasattr(self, "_extraction_state_access_count"):
+            self._extraction_state_access_count = 0
+
+    def _get_extraction_state(self, conversation_id: str) -> MemoryExtractionState:
+        """Get or create the MemoryExtractionState for a conversation.
+
+        Lazily creates a new state object if the conversation_id is unseen.
+        Updates `last_used` on every access, and periodically evicts entries
+        that have not been used for more than _EVICT_AFTER_SECONDS.
+
+        Args:
+            conversation_id: Conversation ID
+
+        Returns:
+            MemoryExtractionState for this conversation
+        """
+        self._extraction_state_access_count += 1
+
+        if conversation_id not in self._extraction_states:
+            self._extraction_states[conversation_id] = MemoryExtractionState()
+        else:
+            self._extraction_states[conversation_id].touch()
+
+        # Periodic eviction of stale entries
+        if self._extraction_state_access_count % _EVICT_EVERY_N_CALLS == 0:
+            self._evict_stale_states()
+
+        return self._extraction_states[conversation_id]
+
+    def _evict_stale_states(self):
+        """Evict conversation states not accessed for more than _EVICT_AFTER_SECONDS.
+
+        Also cancels any pending timers for evicted conversations.
+        """
+        now = time.monotonic()
+        cutoff = now - _EVICT_AFTER_SECONDS
+
+        stale_keys = [
+            cid for cid, state in self._extraction_states.items()
+            if state.last_used < cutoff
+        ]
+
+        if not stale_keys:
+            return
+
+        for cid in stale_keys:
+            state = self._extraction_states.pop(cid)
+            if state.timer and not state.timer.cancelled():
+                state.timer.cancel()
+
+        _LOGGER.debug(
+            "Evicted %d stale conversation states (cutoff: %ds)",
+            len(stale_keys),
+            _EVICT_AFTER_SECONDS,
+        )
+
+    def _get_extraction_mode(self) -> str:
+        """Get the configured extraction mode.
+
+        Returns:
+            Extraction mode string (immediate or idle)
+        """
+        return self.config.get(
+            CONF_MEMORY_EXTRACTION_MODE, DEFAULT_MEMORY_EXTRACTION_MODE
+        )
+
+    def _get_extraction_delay(self) -> int:
+        """Get the configured extraction delay in seconds.
+
+        Enforces bounds (10-300) at runtime for defense-in-depth, in case the
+        config was loaded from storage bypassing schema validation.
+
+        Returns:
+            Delay in seconds (10-300), clamped to valid range
+        """
+        delay = self.config.get(
+            CONF_MEMORY_EXTRACTION_DELAY, DEFAULT_MEMORY_EXTRACTION_DELAY
+        )
+        return max(10, min(300, delay))
+
+    def _get_min_turn_length(self) -> int:
+        """Get the configured minimum turn length.
+
+        Returns:
+            Minimum number of meaningful words (0-50)
+        """
+        return self.config.get(
+            CONF_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+            DEFAULT_MEMORY_EXTRACTION_MIN_TURN_LENGTH,
+        )
+
+    def _is_trivial_turn(self, user_message: str, assistant_response: str) -> bool:
+        """Check if a conversation turn is trivial and should skip extraction.
+
+        Uses a language-agnostic word count heuristic to filter very short turns.
+        Counts user_message and assistant_response separately with early-exit
+        once min_length is reached to avoid unnecessary CPU work.
+
+        Args:
+            user_message: User's message
+            assistant_response: Assistant's response
+
+        Returns:
+            True if the turn is trivial, False if extraction should proceed
+        """
+        min_length = self._get_min_turn_length()
+
+        if min_length <= 0:
+            return False
+
+        # Count tokens in user message first (early-exit if already sufficient)
+        # min_word_length=2 allows 2+ char words for turn filtering
+        word_count = count_meaningful_words(
+            user_message, min_word_length=2, limit=min_length
+        )
+
+        if word_count >= min_length:
+            return False
+
+        # Add tokens from assistant response (only need remaining to reach threshold)
+        remaining = min_length - word_count
+        word_count += count_meaningful_words(
+            assistant_response, min_word_length=2, limit=remaining
+        )
+
+        if word_count < min_length:
+            _LOGGER.debug(
+                "Skipping extraction: turn too short (%d words < %d minimum)",
+                word_count,
+                min_length,
+            )
+            return True
+
+        return False
+
+    def _is_same_turn(self, kwargs: dict[str, Any], conversation_id: str) -> bool:
+        """Check if this is the same (user, assistant) turn as the last extraction.
+
+        Uses a simple tuple of (user_message, assistant_response) for dedup
+        instead of building the full prompt with history.  This catches the
+        "same turn submitted twice" case without expensive prompt construction
+        and avoids creating timer/task threads for duplicates entirely.
+
+        Args:
+            kwargs: Arguments to pass to _extract_and_store_memories
+            conversation_id: Conversation ID
+
+        Returns:
+            True if this is the same turn as the last extraction attempt
+        """
+        user_message = kwargs.get("user_message", "")
+        assistant_response = kwargs.get("assistant_response", "")
+        current_turn = (user_message, assistant_response)
+        state = self._extraction_states.get(conversation_id)
+        last_turn = state.last_turn if state else None
+        return last_turn is not None and last_turn == current_turn
+
+    def _cancel_pending_extraction(self, conversation_id: str):
+        """Cancel any pending extraction timer for a conversation.
+
+        Args:
+            conversation_id: Conversation ID to cancel timer for
+        """
+        state = self._extraction_states.get(conversation_id)
+        if state is None:
+            return
+        timer = state.timer
+        state.timer = None
+        if timer and not timer.cancelled():
+            timer.cancel()
+            _LOGGER.debug("Cancelled pending memory extraction for %s", conversation_id)
+
+    def _get_extraction_lock(self, conversation_id: str) -> asyncio.Lock:
+        """Get or create the asyncio.Lock for a conversation.
+
+        Delegates to _get_extraction_state which handles lazy-init and
+        periodic time-based eviction.
+
+        Args:
+            conversation_id: Conversation ID
+
+        Returns:
+            asyncio.Lock for this conversation
+        """
+        return self._get_extraction_state(conversation_id).lock
+
+    def _execute_scheduled_extraction(self, kwargs: dict[str, Any]):
+        """Execute scheduled memory extraction.
+
+        Removes the timer entry and fires off the async extraction task.
+        If extraction is already running under the lock, overwrite the pending
+        kwargs so only the latest turn gets queued after the current one finishes.
+
+        Args:
+            kwargs: Arguments to pass to _extract_and_store_memories
+        """
+        conversation_id = kwargs.get("conversation_id", "unknown")
+        state = self._extraction_states.get(conversation_id)
+        if state:
+            state.timer = None
+
+        # If lock is held, overwrite pending kwargs (latest turn wins)
+        if state and state.lock.locked():
+            state.pending_kwargs = kwargs
+            _LOGGER.debug(
+                "Queued extraction (overwrite) for %s while lock held", conversation_id
+            )
+            return
+
+        self.hass.async_create_task(self._extract_and_store_memories(**kwargs))
+
+    def _schedule_extraction(self, kwargs: dict[str, Any]):
+        """Schedule memory extraction with debounce, per conversation_id.
+
+        Only one timer and one extraction run per conversation_id at a time.
+        If extraction is already running, the new kwargs *overwrite* any
+        previously pending kwargs — the later turn already sees the full
+        message history, so keeping earlier queued turns is redundant.
+
+        Both immediate and idle modes share the same code path — the only
+        difference is the delay (1 second for immediate, configured value
+        for idle).
+
+        Args:
+            kwargs: Arguments to pass to _extract_and_store_memories
+        """
+        conversation_id = kwargs.get("conversation_id", "unknown")
+
+        # Lazy-init state dicts (mixin may be used before __init__ runs)
+        self._init_memory_extraction()
+
+        # Early exit: memory manager not available
+        if not self.config.get(CONF_MEMORY_ENABLED, DEFAULT_MEMORY_ENABLED):
+            return
+
+        if self.memory_manager is None:
+            _LOGGER.debug("Memory manager not available, skipping scheduling")
+            return
+
+        # Early exit: trivial turn (before creating any timer/task)
+        user_message = kwargs.get("user_message", "")
+        assistant_response = kwargs.get("assistant_response", "")
+        if self._is_trivial_turn(user_message, assistant_response):
+            return
+
+        # Early dedup: skip if this is the same turn as the last attempt
+        if self._is_same_turn(kwargs, conversation_id):
+            _LOGGER.debug(
+                "Skipping scheduling: same turn already extracted for %s", conversation_id
+            )
+            # Still overwrite pending in case extraction is running — the newer
+            # call has the same content but may arrive while lock is held
+            state = self._extraction_states.get(conversation_id)
+            if state and state.lock.locked():
+                state.pending_kwargs = kwargs
+            return
+
+        # Determine delay based on mode (immediate=1s, idle=configured delay)
+        mode = self._get_extraction_mode()
+        if mode == MEMORY_EXTRACTION_MODE_IMMEDIATE:
+            delay = 1
+        else:
+            delay = self._get_extraction_delay()
+
+        # Cancel any pending timer for this conversation
+        self._cancel_pending_extraction(conversation_id)
+
+        # Record the turn so the timer callback can still dedup
+        state = self._get_extraction_state(conversation_id)
+        state.last_turn = (user_message, assistant_response)
+
+        # Schedule extraction with delay
+        loop = asyncio.get_event_loop()
+        state.timer = loop.call_later(
+            delay,
+            self._execute_scheduled_extraction,
+            kwargs,
+        )
+        mode_label = "immediate" if mode == MEMORY_EXTRACTION_MODE_IMMEDIATE else "idle"
+        _LOGGER.debug(
+            "Scheduled memory extraction in %d seconds (%s mode) for %s",
+            delay,
+            mode_label,
+            conversation_id,
+        )
 
     @property
     def memory_validator(self) -> MemoryValidator:
@@ -253,6 +600,7 @@ class MemoryExtractionMixin:
             self._memory_validator = MemoryValidator(
                 min_word_count=min_word_count,
                 min_importance=min_importance,
+                min_word_length=DEFAULT_MEMORY_MIN_WORD_LENGTH,
             )
         return self._memory_validator
 
@@ -334,15 +682,6 @@ Extract the following types of information:
 3. **Context**: Background information useful for future interactions
 4. **Events**: Significant events or actions that occurred
 
-## Previous Conversation
-
-{conversation_text if conversation_text else "(No previous conversation)"}
-
-## Current Turn
-
-User: {user_message}
-Assistant: {assistant_response}
-
 ## Instructions
 
 Extract memories as a JSON array. Each memory should have:
@@ -418,6 +757,15 @@ Return ONLY valid JSON, no other text:
     "topics": ["temperature", "bedroom", "sleep"]
   }}
 ]
+
+## Previous Conversation
+
+{conversation_text if conversation_text else "(No previous conversation)"}
+
+## Latest Turn
+
+User: {user_message}
+Assistant: {assistant_response}
 ```"""
 
         return prompt
@@ -604,11 +952,16 @@ Return ONLY valid JSON, no other text:
         """Extract memories from completed conversation using configured LLM.
 
         This method:
-        1. Determines which LLM to use (external or local)
-        2. Builds extraction prompt
-        3. Calls LLM to extract memories
-        4. Parses JSON response
-        5. Stores memories via MemoryManager
+        1. Acquires per-conversation lock (only one extraction at a time per conv)
+        2. Determines which LLM to use (external or local)
+        3. Builds extraction prompt
+        4. Calls LLM to extract memories
+        5. Parses JSON response
+        6. Stores memories via MemoryManager
+        7. After release, checks if there's a pending newer turn to process
+
+        Prerequisites (memory_enabled, memory_manager, trivial turn, dedup)
+        are checked upstream in _schedule_extraction before scheduling.
 
         Args:
             conversation_id: Conversation ID
@@ -616,85 +969,108 @@ Return ONLY valid JSON, no other text:
             assistant_response: Assistant's response
             full_messages: Complete conversation history
         """
-        try:
-            # Check if memory system is enabled
-            if not self.config.get(CONF_MEMORY_ENABLED, DEFAULT_MEMORY_ENABLED):
-                return
+        # Lazy-init per-conversation state (mixin may be used before __init__ runs)
+        self._init_memory_extraction()
 
-            # Check if memory manager is available
-            if self.memory_manager is None:
-                _LOGGER.debug("Memory manager not available, skipping extraction")
-                return
+        lock = self._get_extraction_lock(conversation_id)
 
-            # Determine which LLM to use for extraction
-            extraction_llm = self.config.get(
-                CONF_MEMORY_EXTRACTION_LLM, DEFAULT_MEMORY_EXTRACTION_LLM
-            )
+        async with lock:
+            try:
+                # Determine which LLM to use for extraction
+                extraction_llm = self.config.get(
+                    CONF_MEMORY_EXTRACTION_LLM, DEFAULT_MEMORY_EXTRACTION_LLM
+                )
 
-            # Build extraction prompt
-            extraction_prompt = self._build_extraction_prompt(
-                user_message=user_message,
-                assistant_response=assistant_response,
-                full_messages=full_messages,
-            )
+                # Build extraction prompt
+                extraction_prompt = self._build_extraction_prompt(
+                    user_message=user_message,
+                    assistant_response=assistant_response,
+                    full_messages=full_messages,
+                )
 
-            # Call appropriate LLM
-            if extraction_llm == "external":
-                # Check if external LLM is enabled
-                if not self.config.get(CONF_EXTERNAL_LLM_ENABLED, False):
-                    _LOGGER.warning(
-                        "Memory extraction configured to use external LLM, "
-                        "but external LLM is not enabled. Skipping extraction."
+                # Call appropriate LLM
+                if extraction_llm == "external":
+                    # Check if external LLM is enabled
+                    if not self.config.get(CONF_EXTERNAL_LLM_ENABLED, False):
+                        _LOGGER.warning(
+                            "Memory extraction configured to use external LLM, "
+                            "but external LLM is not enabled. Skipping extraction."
+                        )
+                        return
+
+                    # Use external LLM tool
+                    _LOGGER.debug("Using external LLM for memory extraction")
+                    result = await self.tool_handler.execute_tool(
+                        tool_name="query_external_llm",
+                        parameters={"prompt": extraction_prompt},
+                        conversation_id=conversation_id,
                     )
-                    return
 
-                # Use external LLM tool
-                _LOGGER.debug("Using external LLM for memory extraction")
-                result = await self.tool_handler.execute_tool(
-                    tool_name="query_external_llm",
-                    parameters={"prompt": extraction_prompt},
+                    if not result.get("success"):
+                        _LOGGER.error(
+                            "External LLM memory extraction failed: %s",
+                            result.get("error"),
+                        )
+                        return
+
+                    extraction_result = result.get("result", "[]")
+
+                else:
+                    # Use local/primary LLM
+                    _LOGGER.debug("Using local LLM for memory extraction")
+                    result = await self._call_primary_llm_for_extraction(extraction_prompt)
+
+                    if not result.get("success"):
+                        _LOGGER.error(
+                            "Local LLM memory extraction failed: %s",
+                            result.get("error"),
+                        )
+                        return
+
+                    extraction_result = result.get("result", "[]")
+
+                # Parse and store memories
+                stored_count = await self._parse_and_store_memories(
+                    extraction_result=extraction_result,
                     conversation_id=conversation_id,
                 )
 
-                if not result.get("success"):
-                    _LOGGER.error(
-                        "External LLM memory extraction failed: %s",
-                        result.get("error"),
+                # Fire event if memories were extracted
+                if stored_count > 0 and self.config.get(CONF_EMIT_EVENTS, True):
+                    from datetime import datetime
+
+                    self.hass.bus.async_fire(
+                        EVENT_MEMORY_EXTRACTED,
+                        {
+                            "conversation_id": conversation_id,
+                            "memories_extracted": stored_count,
+                            "extraction_llm": extraction_llm,
+                            "timestamp": datetime.now().isoformat(
+                                timespec="seconds"
+                            ),
+                        },
                     )
-                    return
 
-                extraction_result = result.get("result", "[]")
-
-            else:
-                # Use local/primary LLM
-                _LOGGER.debug("Using local LLM for memory extraction")
-                result = await self._call_primary_llm_for_extraction(extraction_prompt)
-
-                if not result.get("success"):
-                    _LOGGER.error("Local LLM memory extraction failed: %s", result.get("error"))
-                    return
-
-                extraction_result = result.get("result", "[]")
-
-            # Parse and store memories
-            stored_count = await self._parse_and_store_memories(
-                extraction_result=extraction_result,
-                conversation_id=conversation_id,
-            )
-
-            # Fire event if memories were extracted
-            if stored_count > 0 and self.config.get(CONF_EMIT_EVENTS, True):
-                from datetime import datetime
-
-                self.hass.bus.async_fire(
-                    EVENT_MEMORY_EXTRACTED,
-                    {
-                        "conversation_id": conversation_id,
-                        "memories_extracted": stored_count,
-                        "extraction_llm": extraction_llm,
-                        "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    },
-                )
-
-        except Exception as err:
-            _LOGGER.exception("Error during memory extraction: %s", err)
+            except Exception as err:
+                _LOGGER.exception("Error during memory extraction: %s", err)
+            finally:
+                # After releasing lock, check if there's a pending newer turn.
+                # Only one pending set of kwargs is kept (the most recent),
+                # because the later turn already sees the full message history.
+                #
+                # NOTE: We intentionally do NOT remove the state object here —
+                # the lock must persist to serialize concurrent extractions for
+                # the same conversation, and last_turn is needed for dedup.
+                # Stale entries are evicted by _evict_stale_states() based on
+                # last_used age.
+                state = self._extraction_states.get(conversation_id)
+                if state:
+                    pending_kwargs = state.pending_kwargs
+                    state.pending_kwargs = None
+                    if pending_kwargs is not None:
+                        _LOGGER.debug(
+                            "Processing deferred extraction for %s", conversation_id
+                        )
+                        self.hass.async_create_task(
+                            self._extract_and_store_memories(**pending_kwargs)
+                        )
