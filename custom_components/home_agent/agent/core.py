@@ -1523,6 +1523,7 @@ class HomeAgent(
             device_id=device_id,
         )
 
+        continue_conv = False
         if self.config.get(CONF_CONTINUE_ON_QUESTION, DEFAULT_CONTINUE_ON_QUESTION):
             # Extract final response to check for "?"
             final_response = ""
@@ -1530,7 +1531,6 @@ class HomeAgent(
                 if isinstance(content_item, conversation.AssistantContent) and content_item.content:
                     final_response = content_item.content
                     break
-            continue_conv = False
             if final_response.strip().endswith("?"):
                 continue_conv = True
                 _LOGGER.debug(
