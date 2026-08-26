@@ -25,6 +25,7 @@ from homeassistant.core import HomeAssistant
 
 from custom_components.home_agent.agent import HomeAgent
 from custom_components.home_agent.const import (
+    CONF_CONTINUE_ON_QUESTION,
     CONF_LLM_API_KEY,
     CONF_LLM_BASE_URL,
     CONF_LLM_MODEL,
@@ -528,3 +529,86 @@ async def test_realistic_streaming_edge_case_empty_content(
                     # Should terminate gracefully
                     assert result is not None
                     assert mock_chat_log._call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_realistic_streaming_continue_on_question_false(
+    session_manager,
+    mock_hass_for_streaming,
+    streaming_config,
+    mock_user_input,
+):
+    """Regression test: streaming with CONF_CONTINUE_ON_QUESTION=False.
+
+    This is the exact production configuration where the original
+    UnboundLocalError on ``continue_conv`` occurred: the config-gated block
+    that initialized ``continue_conv`` was skipped, but the variable was
+    still referenced when building the result. The streaming path saved the
+    turn to history first, then failed late, and the synchronous fallback
+    re-ran the same user input — duplicating it in conversation history.
+
+    The fix pre-initializes ``continue_conv = False``; the guard additionally
+    prevents a late failure from triggering the synchronous fallback at all.
+
+    This test exercises the REAL _async_process_streaming end-to-end (mocked
+    SSE stream + RealisticChatLogMock + patched async_get_result_from_chat_log)
+    with continue_on_question disabled, and verifies the turn completes with
+    exactly one LLM call and no exception.
+    """
+    with patch("custom_components.home_agent.agent.core.async_should_expose") as mock_expose:
+        mock_expose.return_value = False
+
+        config = {
+            **streaming_config,
+            CONF_CONTINUE_ON_QUESTION: False,
+        }
+        agent = HomeAgent(mock_hass_for_streaming, config, session_manager)
+
+        # Single LLM call: Returns text only
+        stream_lines = create_text_stream("Hello! How can I help you?")
+
+        call_count = [0]
+
+        def create_response(lines):
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.content = MagicMock()
+            mock_resp.content.__aiter__ = lambda self: create_mock_sse_stream(lines)
+            mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+            mock_resp.__aexit__ = AsyncMock(return_value=None)
+            return mock_resp
+
+        def mock_post(*args, **kwargs):
+            call_count[0] += 1
+            return create_response(stream_lines)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(side_effect=mock_post)
+        mock_session.closed = False
+
+        # Use realistic ChatLog mock
+        mock_chat_log = RealisticChatLogMock()
+
+        with patch.object(agent, "_ensure_session", return_value=mock_session):
+            with patch(
+                "homeassistant.components.conversation.chat_log.current_chat_log"
+            ) as mock_ctx:
+                mock_ctx.get.return_value = mock_chat_log
+
+                mock_result = conversation.ConversationResult(
+                    response=MagicMock(),
+                    conversation_id="test_123",
+                )
+                with patch(
+                    "homeassistant.components.conversation.async_get_result_from_chat_log",
+                    return_value=mock_result,
+                ):
+                    # Execute — must NOT raise UnboundLocalError on continue_conv
+                    result = await agent.async_process(mock_user_input)
+
+                    assert result is not None
+                    assert result.conversation_id == "test_123"
+                    assert call_count[0] == 1, f"Expected 1 LLM call, got {call_count[0]}"
+                    assert (
+                        mock_chat_log._call_count == 1
+                    ), f"Expected 1 stream iteration, got {mock_chat_log._call_count}"

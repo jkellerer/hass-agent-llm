@@ -152,8 +152,14 @@ class TestAsyncProcessBranching:
             # Call async_process
             result = await agent.async_process(mock_input)
 
-            # Verify streaming path was called
-            mock_stream.assert_called_once_with(mock_input)
+            # Verify streaming path was called with the user input and a
+            # mutable turn_state dict (used to detect late failures after the
+            # turn was already persisted to history)
+            mock_stream.assert_called_once()
+            assert mock_stream.call_args[0][0] is mock_input
+            turn_state = mock_stream.call_args[0][1]
+            assert isinstance(turn_state, dict)
+            assert turn_state["completed"] is False
             assert result is not None
 
     @pytest.mark.asyncio
@@ -190,7 +196,8 @@ class TestAsyncProcessBranching:
             result = await agent.async_process(mock_input)
 
             # Verify both paths were called
-            mock_stream.assert_called_once_with(mock_input)
+            mock_stream.assert_called_once()
+            assert mock_stream.call_args[0][0] is mock_input
             mock_sync.assert_called_once_with(mock_input)
 
             # Verify error event was fired
@@ -248,6 +255,136 @@ class TestStreamingErrorEvents:
             assert event_data["error"] == error_message
             assert event_data["error_type"] == "RuntimeError"
             assert event_data["fallback"] is True
+
+
+class TestStreamingFallbackGuard:
+    """Test the turn_state idempotency guard.
+
+    Guards against the production bug where streaming persisted the turn to
+    conversation history but then failed late (UnboundLocalError on
+    continue_conv), causing the synchronous fallback to re-run the same user
+    input and duplicate it in history.
+    """
+
+    def _make_input(self):
+        mock_input = MagicMock(spec=ha_conversation.ConversationInput)
+        mock_input.text = "Turn on the lights"
+        mock_input.conversation_id = "test-conv"
+        mock_input.language = "en"
+        mock_input.context = MagicMock()
+        mock_input.context.user_id = "test-user"
+        mock_input.device_id = None
+        return mock_input
+
+    @pytest.mark.asyncio
+    async def test_turn_state_flag_not_completed_on_early_failure(self, agent):
+        """A failure before the history save leaves turn_state['completed'] False.
+
+        The guard in _async_process_streaming only flips the flag after
+        add_messages succeeds. A mock that raises immediately (simulating a
+        failure before any save) must leave the flag untouched.
+        """
+        agent.config[CONF_STREAMING_ENABLED] = True
+
+        def fail_early(user_input, turn_state=None):
+            # Failure happens BEFORE the history save, so the streaming path
+            # never touches turn_state — the flag must remain False.
+            raise RuntimeError("early streaming failure")
+
+        mock_input = self._make_input()
+        mock_chat_log_instance = MagicMock()
+        mock_chat_log_instance.delta_listener = MagicMock()
+
+        with (
+            patch(
+                "homeassistant.components.conversation.chat_log.current_chat_log"
+            ) as mock_chat_log,
+            patch.object(agent, "_async_process_streaming", new_callable=AsyncMock) as mock_stream,
+            patch.object(agent, "_async_process_synchronous", new_callable=AsyncMock) as mock_sync,
+        ):
+            mock_chat_log.get.return_value = mock_chat_log_instance
+            mock_stream.side_effect = fail_early
+            mock_sync.return_value = MagicMock(spec=ha_conversation.ConversationResult)
+
+            result = await agent.async_process(mock_input)
+
+            # Fallback happened because the turn was NOT persisted
+            mock_stream.assert_called_once()
+            mock_sync.assert_called_once_with(mock_input)
+            agent.hass.bus.async_fire.assert_called()
+            assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_when_turn_already_saved(self, agent):
+        """A late failure (after the history save) must NOT fall back to sync.
+
+        This is the exact production scenario: streaming saved the turn to
+        history, then failed while building the result. Falling back would
+        re-run the same user input and duplicate it in history. The guard must
+        skip the fallback; the error is re-raised and converted to an error
+        response by the outer handler.
+        """
+        agent.config[CONF_STREAMING_ENABLED] = True
+
+        def fail_late_after_save(user_input, turn_state):
+            # Simulate: history was already persisted before the late failure
+            turn_state["completed"] = True
+            raise RuntimeError("Late streaming failure")
+
+        mock_input = self._make_input()
+        mock_chat_log_instance = MagicMock()
+        mock_chat_log_instance.delta_listener = MagicMock()
+
+        with (
+            patch(
+                "homeassistant.components.conversation.chat_log.current_chat_log"
+            ) as mock_chat_log,
+            patch.object(agent, "_async_process_streaming", new_callable=AsyncMock) as mock_stream,
+            patch.object(agent, "_async_process_synchronous", new_callable=AsyncMock) as mock_sync,
+        ):
+            mock_chat_log.get.return_value = mock_chat_log_instance
+            mock_stream.side_effect = fail_late_after_save
+
+            result = await agent.async_process(mock_input)
+
+            # The synchronous fallback must NOT run — that would duplicate
+            # the user message in conversation history.
+            mock_stream.assert_called_once()
+            mock_sync.assert_not_called()
+
+            # The streaming error event (fallback=True) must NOT fire either,
+            # since no fallback occurred.
+            agent.hass.bus.async_fire.assert_not_called()
+
+            # The outer catch-all converts the re-raised error into a generic
+            # error response instead of propagating it.
+            assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_turn_state_passed_as_second_argument(self, agent):
+        """async_process must pass a mutable dict as turn_state to streaming."""
+        agent.config[CONF_STREAMING_ENABLED] = True
+
+        mock_input = self._make_input()
+        mock_chat_log_instance = MagicMock()
+        mock_chat_log_instance.delta_listener = MagicMock()
+
+        with (
+            patch(
+                "homeassistant.components.conversation.chat_log.current_chat_log"
+            ) as mock_chat_log,
+            patch.object(agent, "_async_process_streaming", new_callable=AsyncMock) as mock_stream,
+        ):
+            mock_chat_log.get.return_value = mock_chat_log_instance
+            mock_stream.return_value = MagicMock(spec=ha_conversation.ConversationResult)
+
+            await agent.async_process(mock_input)
+
+            mock_stream.assert_called_once()
+            args = mock_stream.call_args[0]
+            assert args[0] is mock_input
+            assert isinstance(args[1], dict)
+            assert args[1]["completed"] is False
 
 
 class TestCallLLMStreaming:

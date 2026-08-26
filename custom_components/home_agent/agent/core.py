@@ -336,9 +336,25 @@ class HomeAgent(
 
             # Check if we can stream
             if self._can_stream():
+                # Tracks whether the streaming path already persisted the
+                # turn before failing late. If it did, falling back to
+                # synchronous processing would re-run the same user input
+                # and duplicate it in conversation history.
+                turn_state = {"completed": False}
                 try:
-                    return await self._async_process_streaming(user_input)
+                    return await self._async_process_streaming(
+                        user_input, turn_state
+                    )
                 except Exception as err:
+                    if turn_state["completed"]:
+                        _LOGGER.error(
+                            "Streaming failed after the turn was already saved "
+                            "to history; skipping synchronous fallback to avoid "
+                            "duplicating the user message: %s",
+                            err,
+                            exc_info=True,
+                        )
+                        raise
                     # Fallback to synchronous on streaming errors
                     _LOGGER.warning(
                         "Streaming failed, falling back to synchronous mode: %s",
@@ -1018,12 +1034,18 @@ class HomeAgent(
             raise
 
     async def _async_process_streaming(
-        self, user_input: ha_conversation.ConversationInput
+        self,
+        user_input: ha_conversation.ConversationInput,
+        turn_state: dict | None = None,
     ) -> ha_conversation.ConversationResult:
         """Process conversation with streaming support.
 
         Args:
             user_input: The conversation input
+            turn_state: Optional mutable state dict. When provided,
+                ``turn_state["completed"]`` is set to True as soon as the
+                turn is persisted to conversation history, so the caller
+                can avoid re-processing the turn if this method fails late.
 
         Returns:
             ConversationResult with the response
@@ -1451,6 +1473,12 @@ class HomeAgent(
                 turn_messages = self._filter_tool_messages(turn_messages)
 
             evicted = self.conversation_manager.add_messages(conversation_id, turn_messages)
+
+            # Mark the turn as persisted so a late-stage failure in this
+            # streaming path does not trigger a synchronous re-processing
+            # (which would duplicate the user message in history).
+            if turn_state is not None:
+                turn_state["completed"] = True
 
             # Invalidate system prompt cache if history was evicted
             if evicted:
